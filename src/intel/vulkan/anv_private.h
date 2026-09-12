@@ -1856,6 +1856,14 @@ extern enum anv_debug anv_debug;
 
 #define ANV_DEBUG(name) unlikely(anv_debug & ANV_DEBUG_##name)
 
+static inline bool
+anv_physical_device_has_video_encode(const struct anv_physical_device *device)
+{
+   /* Xe2: only BMG is wired up, LNL programs a different VDEnc command set. */
+   return (device->info.verx10 <= 125 && ANV_DEBUG(VIDEO_ENCODE)) ||
+          device->info.platform == INTEL_PLATFORM_BMG;
+}
+
 static inline bool anv_needs_printf_buffer(void)
 {
    return ANV_DEBUG(SHADER_PRINT) || ANV_DEBUG(DGC_DUMP);
@@ -6056,6 +6064,16 @@ struct anv_image {
 
    struct anv_image_memory_range vid_dmv_top_surface;
 
+   /* HEVC VDENC 4x/8x HME downscaled surfaces. Packed NV12 as a 1.5x-tall
+    * R8 surface (UV starts at luma height). Tile-F, matching media-driver.
+    */
+   uint16_t vid_vdenc_ds4x_width;
+   uint16_t vid_vdenc_ds4x_height;
+   uint16_t vid_vdenc_ds8x_width;
+   uint16_t vid_vdenc_ds8x_height;
+   struct anv_surface vid_vdenc_ds4x;
+   struct anv_surface vid_vdenc_ds8x;
+
    /* Link in the anv_device.image_private_objects list */
    struct list_head link;
    /* Whether the image was added to anv_device.image_private_objects list */
@@ -7016,6 +7034,8 @@ enum anv_vid_mem_h265_types {
    ANV_VID_MEM_H265_PAK_STREAMOUT,
    ANV_VID_MEM_H265_SAO_STREAMOUT,
    ANV_VID_MEM_H265_VDENC_INTRA_ROW_STORE,
+   ANV_VID_MEM_H265_VDENC_TILE_ROW_STORE,
+   ANV_VID_MEM_H265_VDENC_CUMULATIVE_CU_COUNT,
    ANV_VID_MEM_H265_ENC_MAX,
 };
 
@@ -7233,6 +7253,31 @@ anv_image_dmv_top_address(const struct anv_image_view *iv,
 
    return anv_address_add(addr, iv->image->vid_dmv_top_surface_pitch_B *
                                     ((uint64_t)iv->vk.base_array_layer + arrayLayer));
+}
+
+static inline bool
+anv_image_has_vdenc_ds(const struct anv_image *image)
+{
+   return image->vid_vdenc_ds4x.isl.size_B > 0 &&
+          image->vid_vdenc_ds8x.isl.size_B > 0;
+}
+
+static inline struct anv_address MUST_CHECK
+anv_image_vdenc_ds_address(const struct anv_image_view *iv,
+                           uint32_t arrayLayer, bool is_8x)
+{
+   const struct anv_surface *surf =
+      is_8x ? &iv->image->vid_vdenc_ds8x : &iv->image->vid_vdenc_ds4x;
+
+   struct anv_address addr = anv_image_address(iv->image, &surf->memory_range);
+   if (anv_address_is_null(addr))
+      return addr;
+
+   uint64_t offset_B;
+   isl_surf_get_image_offset_B_tile_sa(&surf->isl, 0,
+                                       iv->vk.base_array_layer + arrayLayer,
+                                       0, &offset_B, NULL, NULL);
+   return anv_address_add(addr, offset_B);
 }
 
 static inline struct anv_address MUST_CHECK

@@ -334,10 +334,8 @@ get_device_extensions(const struct anv_physical_device *device,
                       struct vk_device_extension_table *ext)
 {
    const bool rt_enabled = ANV_SUPPORT_RT && device->info.has_ray_tracing;
-   const bool hw_video_encode_supported = device->info.verx10 <= 125;
-
-   const bool video_encode_enabled = hw_video_encode_supported &&
-                                     ANV_DEBUG(VIDEO_ENCODE);
+   const bool video_encode_enabled =
+      anv_physical_device_has_video_encode(device);
    const bool video_decode_enabled = ANV_DEBUG(VIDEO_DECODE);
 
    if (VIDEO_CODEC_H265DEC && video_decode_enabled && !device->has_huc)
@@ -2911,7 +2909,8 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
             .engine_class = compute_class,
          };
       }
-      if (v_count > 0 && (ANV_DEBUG(VIDEO_DECODE) || ANV_DEBUG(VIDEO_ENCODE))) {
+      if (v_count > 0 && (ANV_DEBUG(VIDEO_DECODE) ||
+                          anv_physical_device_has_video_encode(pdevice))) {
          /* HEVC support on Gfx9 is only available on VCS0. So limit the number of video queues
           * to the first VCS engine instance.
           *
@@ -2926,7 +2925,7 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
          pdevice->queue.families[family_count++] = (struct anv_queue_family) {
             .queueFlags = (ANV_DEBUG(VIDEO_DECODE) ?
                            VK_QUEUE_VIDEO_DECODE_BIT_KHR : 0) |
-                          (ANV_DEBUG(VIDEO_ENCODE) ?
+                          (anv_physical_device_has_video_encode(pdevice) ?
                            VK_QUEUE_VIDEO_ENCODE_BIT_KHR : 0),
             .queueCount = pdevice->info.ver == 9 ? MIN2(1, v_count) : v_count,
             .engine_class = INTEL_ENGINE_CLASS_VIDEO,
@@ -3434,6 +3433,7 @@ void anv_GetPhysicalDeviceQueueFamilyProperties2(
             case VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR: {
                VkQueueFamilyVideoPropertiesKHR *prop =
                   (VkQueueFamilyVideoPropertiesKHR *)ext;
+               prop->videoCodecOperations = 0;
                if (queue_family->queueFlags & VK_QUEUE_VIDEO_DECODE_BIT_KHR) {
                   prop->videoCodecOperations = VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR |
                                                VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR |

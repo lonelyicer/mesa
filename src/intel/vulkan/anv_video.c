@@ -68,32 +68,52 @@ anv_DestroyVideoSessionKHR(VkDevice _device,
    vk_free2(&device->vk.alloc, pAllocator, vid);
 }
 
+/* Keep override feedback per parameter-set ID, including inherited sets. */
+struct anv_video_session_parameters {
+   struct vk_video_session_parameters vk;
+   bool sps_overrides[32];
+   bool pps_overrides[256];
+};
+
 static void
 anv_video_patch_encode_session_parameters(struct anv_device *device, struct vk_video_session_parameters *params)
 {
+   struct anv_video_session_parameters *anv_params =
+      container_of(params, struct anv_video_session_parameters, vk);
+
    switch (params->op) {
    case VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR: {
       /* Set 0 where we don't advertise via stdSyntaxFlags */
       for (unsigned i = 0; i < params->h264_enc.h264_sps_count; i++) {
          StdVideoH264SequenceParameterSet *sps = &params->h264_enc.h264_sps[i].base;
+         StdVideoH264SequenceParameterSet original;
+         memcpy(&original, sps, sizeof(original));
 
          sps->flags.separate_colour_plane_flag = 0;
          sps->flags.qpprime_y_zero_transform_bypass_flag = 0;
          sps->flags.seq_scaling_matrix_present_flag = 0;
+         anv_params->sps_overrides[sps->seq_parameter_set_id] |=
+            memcmp(&original, sps, sizeof(original)) != 0;
       }
 
       for (unsigned i = 0; i < params->h264_enc.h264_pps_count; i++) {
          StdVideoH264PictureParameterSet *pps = &params->h264_enc.h264_pps[i].base;
+         StdVideoH264PictureParameterSet original;
+         memcpy(&original, pps, sizeof(original));
 
          pps->flags.pic_scaling_matrix_present_flag = 0;
          pps->flags.weighted_pred_flag = 0;
          pps->weighted_bipred_idc = STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT;
+         anv_params->pps_overrides[pps->pic_parameter_set_id] |=
+            memcmp(&original, pps, sizeof(original)) != 0;
       }
       break;
    }
    case VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR: {
       for (unsigned i = 0; i < params->h265_enc.h265_sps_count; i++) {
          StdVideoH265SequenceParameterSet *sps = &params->h265_enc.h265_sps[i].base;
+         StdVideoH265SequenceParameterSet original;
+         memcpy(&original, sps, sizeof(original));
 
          /* CTB: 64, transform: 4..32 */
          sps->log2_min_luma_coding_block_size_minus3 = 0;
@@ -108,15 +128,45 @@ anv_video_patch_encode_session_parameters(struct anv_device *device, struct vk_v
          sps->flags.separate_colour_plane_flag = 0;
          sps->flags.pcm_enabled_flag = 0;
          sps->flags.sps_temporal_mvp_enabled_flag = 0;
+         /* The VDEnc partition search can select asymmetric motion
+          * partitions. HCP and the decoder must both allow AMP even when
+          * the application did not enable it in the original SPS.
+          */
+         sps->flags.amp_enabled_flag = 1;
+         /* Use the transform depth supported by the current VDEnc search.
+          * media-driver limits VDEnc HEVC depths to at most 2. Depths 3/4
+          * corrupt even intra pictures, while depth 0 disallows splits the
+          * current search can emit in inter pictures. Export the same depth
+          * that HCP uses, and report the override below.
+          */
+         sps->max_transform_hierarchy_depth_intra = 2;
+         sps->max_transform_hierarchy_depth_inter = 2;
+         /* HW FQM/QM are identity-16. scaling_list_enabled with present=0
+          * makes the decoder use the spec default lists instead, which
+          * CABAC-desyncs into noise.
+          */
+         sps->flags.scaling_list_enabled_flag = 0;
+         sps->flags.sps_scaling_list_data_present_flag = 0;
+         /* SAO in the slice header without matching HCP_SLICE_STATE (or
+          * the reverse) also desyncs. VDENC SAO is not reliable here yet.
+          */
+         sps->flags.sample_adaptive_offset_enabled_flag = 0;
+         anv_params->sps_overrides[sps->sps_seq_parameter_set_id] |=
+            memcmp(&original, sps, sizeof(original)) != 0;
       }
       for (unsigned i = 0; i < params->h265_enc.h265_pps_count; i++) {
          StdVideoH265PictureParameterSet *pps = &params->h265_enc.h265_pps[i].base;
+         StdVideoH265PictureParameterSet original;
+         memcpy(&original, pps, sizeof(original));
 
          /* maxTiles = 1x1 */
          pps->flags.tiles_enabled_flag = 0;
 
-         /* rateControlModes is DEFAULT|DISABLED only — no cu_qp_delta path */
-         pps->flags.cu_qp_delta_enabled_flag = 0;
+         /* VDENC always emits cu_qp_delta in the bitstream (Max_DQP_Level 0
+          * or 3). The PPS must match or the decoder CABAC-desyncs into noise.
+          */
+         pps->flags.cu_qp_delta_enabled_flag = 1;
+         pps->diff_cu_qp_delta_depth = 0;
 
          /* Set 0 where we don't advertise via stdSyntaxFlags */
          pps->flags.weighted_pred_flag = 0;
@@ -129,7 +179,17 @@ anv_video_patch_encode_session_parameters(struct anv_device *device, struct vk_v
          pps->flags.dependent_slice_segments_enabled_flag = 0;
          pps->flags.pps_slice_chroma_qp_offsets_present_flag = 0;
          pps->flags.pps_scaling_list_data_present_flag = 0;
+         pps->flags.transform_skip_enabled_flag = 0;
+         /* CABAC init selection and reference-list modification are supported
+          * by both the header packer and HCP. Keep the application's flags so
+          * the bitstream describes the state submitted to the hardware.
+          */
+         pps->flags.output_flag_present_flag = 0;
+         pps->flags.slice_segment_header_extension_present_flag = 0;
+         pps->num_extra_slice_header_bits = 0;
          pps->log2_parallel_merge_level_minus2 = 0;
+         anv_params->pps_overrides[pps->pps_pic_parameter_set_id] |=
+            memcmp(&original, pps, sizeof(original)) != 0;
       }
       break;
    }
@@ -159,13 +219,89 @@ anv_CreateVideoSessionParametersKHR(VkDevice _device, const VkVideoSessionParame
    ANV_FROM_HANDLE(anv_device, device, _device);
 
    struct vk_video_session_parameters *params =
-      vk_video_session_parameters_create(&device->vk, pCreateInfo, pAllocator, sizeof(*params));
+      vk_video_session_parameters_create(&device->vk, pCreateInfo, pAllocator,
+                                         sizeof(struct anv_video_session_parameters));
    if (!params)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   VK_FROM_HANDLE(vk_video_session_parameters, templ,
+                  pCreateInfo->videoSessionParametersTemplate);
+   if (templ) {
+      struct anv_video_session_parameters *anv_params =
+         container_of(params, struct anv_video_session_parameters, vk);
+      const struct anv_video_session_parameters *anv_templ =
+         container_of(templ, struct anv_video_session_parameters, vk);
+      memcpy(anv_params->sps_overrides, anv_templ->sps_overrides,
+             sizeof(anv_params->sps_overrides));
+      memcpy(anv_params->pps_overrides, anv_templ->pps_overrides,
+             sizeof(anv_params->pps_overrides));
+
+      /* Explicitly supplied sets take precedence over the template. */
+      if (params->op == VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
+         const VkVideoEncodeH264SessionParametersCreateInfoKHR *info =
+            vk_find_struct_const(pCreateInfo->pNext, VIDEO_ENCODE_H264_SESSION_PARAMETERS_CREATE_INFO_KHR);
+         const VkVideoEncodeH264SessionParametersAddInfoKHR *add = info->pParametersAddInfo;
+         if (add) {
+            for (unsigned i = 0; i < add->stdSPSCount; i++)
+               anv_params->sps_overrides[add->pStdSPSs[i].seq_parameter_set_id] = false;
+            for (unsigned i = 0; i < add->stdPPSCount; i++)
+               anv_params->pps_overrides[add->pStdPPSs[i].pic_parameter_set_id] = false;
+         }
+      } else if (params->op == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
+         const VkVideoEncodeH265SessionParametersCreateInfoKHR *info =
+            vk_find_struct_const(pCreateInfo->pNext, VIDEO_ENCODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR);
+         const VkVideoEncodeH265SessionParametersAddInfoKHR *add = info->pParametersAddInfo;
+         if (add) {
+            for (unsigned i = 0; i < add->stdSPSCount; i++)
+               anv_params->sps_overrides[add->pStdSPSs[i].sps_seq_parameter_set_id] = false;
+            for (unsigned i = 0; i < add->stdPPSCount; i++)
+               anv_params->pps_overrides[add->pStdPPSs[i].pps_pic_parameter_set_id] = false;
+         }
+      }
+   }
    anv_video_patch_session_parameters(device, params);
 
    *pVideoSessionParameters = vk_video_session_parameters_to_handle(params);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+anv_UpdateVideoSessionParametersKHR(VkDevice _device,
+                                    VkVideoSessionParametersKHR videoSessionParameters,
+                                    const VkVideoSessionParametersUpdateInfoKHR *pUpdateInfo)
+{
+   ANV_FROM_HANDLE(anv_device, device, _device);
+   VK_FROM_HANDLE(vk_video_session_parameters, params, videoSessionParameters);
+
+   VkResult result = vk_video_session_parameters_update(params, pUpdateInfo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   struct anv_video_session_parameters *anv_params =
+      container_of(params, struct anv_video_session_parameters, vk);
+   if (params->op == VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
+      const VkVideoEncodeH264SessionParametersAddInfoKHR *add =
+         vk_find_struct_const(pUpdateInfo->pNext,
+                              VIDEO_ENCODE_H264_SESSION_PARAMETERS_ADD_INFO_KHR);
+      if (add) {
+         for (unsigned i = 0; i < add->stdSPSCount; i++)
+            anv_params->sps_overrides[add->pStdSPSs[i].seq_parameter_set_id] = false;
+         for (unsigned i = 0; i < add->stdPPSCount; i++)
+            anv_params->pps_overrides[add->pStdPPSs[i].pic_parameter_set_id] = false;
+      }
+   } else if (params->op == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
+      const VkVideoEncodeH265SessionParametersAddInfoKHR *add =
+         vk_find_struct_const(pUpdateInfo->pNext,
+                              VIDEO_ENCODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR);
+      if (add) {
+         for (unsigned i = 0; i < add->stdSPSCount; i++)
+            anv_params->sps_overrides[add->pStdSPSs[i].sps_seq_parameter_set_id] = false;
+         for (unsigned i = 0; i < add->stdPPSCount; i++)
+            anv_params->pps_overrides[add->pStdPPSs[i].pps_pic_parameter_set_id] = false;
+      }
+   }
+
+   anv_video_patch_session_parameters(device, params);
    return VK_SUCCESS;
 }
 
@@ -234,6 +370,14 @@ video_profile_supported(struct anv_physical_device *pdevice,
          if (profile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
             return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
       }
+
+      /* 10-bit HEVC encode is not usable yet: Steam Link gets a valid
+       * session and ACKs frames, but the bitstream is visual noise.
+       * Main10 decode stays enabled.
+       */
+      if (profile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR &&
+          profile->lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+         return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
 
       break;
    }
@@ -419,8 +563,8 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
                       VK_VIDEO_ENCODE_H264_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR;
          ext->maxLevelIdc = STD_VIDEO_H264_LEVEL_IDC_5_1;
          ext->maxSliceCount = 1;
-         ext->maxPPictureL0ReferenceCount = 8;
-         ext->maxBPictureL0ReferenceCount = 8;
+         ext->maxPPictureL0ReferenceCount = 3;
+         ext->maxBPictureL0ReferenceCount = 3;
          ext->maxL1ReferenceCount = 1;
          ext->maxTemporalLayerCount = 0;
          ext->expectDyadicTemporalLayerPattern = false;
@@ -443,11 +587,13 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       pCapabilities->minBitstreamBufferSizeAlignment = 4096;
 
       pCapabilities->maxDpbSlots = ANV_VIDEO_H264_MAX_NUM_REF_FRAME;
-      pCapabilities->maxActiveReferencePictures = ANV_VIDEO_H264_MAX_NUM_REF_FRAME;
+      pCapabilities->maxActiveReferencePictures = 4;
       pCapabilities->pictureAccessGranularity.width = ANV_MB_WIDTH;
       pCapabilities->pictureAccessGranularity.height = ANV_MB_HEIGHT;
-      pCapabilities->minCodedExtent.width = ANV_MB_WIDTH;
-      pCapabilities->minCodedExtent.height = ANV_MB_HEIGHT;
+      pCapabilities->minCodedExtent.width =
+         pdevice->info.platform == INTEL_PLATFORM_BMG ? 32 : ANV_MB_WIDTH;
+      pCapabilities->minCodedExtent.height =
+         pdevice->info.platform == INTEL_PLATFORM_BMG ? 32 : ANV_MB_HEIGHT;
 
       strcpy(pCapabilities->stdHeaderVersion.extensionName, VK_STD_VULKAN_VIDEO_CODEC_H264_ENCODE_EXTENSION_NAME);
       pCapabilities->stdHeaderVersion.specVersion = VK_STD_VULKAN_VIDEO_CODEC_H264_ENCODE_SPEC_VERSION;
@@ -458,16 +604,20 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
          vk_find_struct(pCapabilities->pNext, VIDEO_ENCODE_H265_CAPABILITIES_KHR);
 
       if (ext) {
-         ext->flags = VK_VIDEO_ENCODE_H265_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR;
+         ext->flags = VK_VIDEO_ENCODE_H265_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR |
+                      VK_VIDEO_ENCODE_H265_CAPABILITY_MULTIPLE_SLICE_SEGMENTS_PER_TILE_BIT_KHR;
          ext->maxLevelIdc = STD_VIDEO_H265_LEVEL_IDC_5_1;
-         ext->ctbSizes = VK_VIDEO_ENCODE_H265_CTB_SIZE_32_BIT_KHR |
-                         VK_VIDEO_ENCODE_H265_CTB_SIZE_64_BIT_KHR;
+         /* Session parameters are patched to CTB 64. Advertising 32 as well
+          * made Steam Link size slice_segment_address on a 32-CTB grid.
+          */
+         ext->ctbSizes = VK_VIDEO_ENCODE_H265_CTB_SIZE_64_BIT_KHR;
          ext->transformBlockSizes = VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_4_BIT_KHR |
                                     VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_8_BIT_KHR |
                                     VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_16_BIT_KHR |
                                     VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_32_BIT_KHR;
-         ext->maxPPictureL0ReferenceCount = 8;
-         ext->maxBPictureL0ReferenceCount = 8;
+         /* VDEnc has three forward references and one backward reference. */
+         ext->maxPPictureL0ReferenceCount = 3;
+         ext->maxBPictureL0ReferenceCount = 3;
          ext->maxL1ReferenceCount = 1;
          ext->minQp = 10;
          ext->maxQp = 51;
@@ -478,19 +628,23 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
          ext->expectDyadicTemporalSubLayerPattern = false;
          ext->prefersGopRemainingFrames = 0;
          ext->requiresGopRemainingFrames = 0;
-         ext->stdSyntaxFlags = VK_VIDEO_ENCODE_H265_STD_SAMPLE_ADAPTIVE_OFFSET_ENABLED_FLAG_SET_BIT_KHR |
-                               VK_VIDEO_ENCODE_H265_STD_TRANSFORM_SKIP_ENABLED_FLAG_SET_BIT_KHR;
+         /* Do not advertise SAO / transform skip: session params are patched
+          * off, and a mismatch with GetEncoded headers snows the decoder.
+          */
+         ext->stdSyntaxFlags = 0;
       }
 
       pCapabilities->minBitstreamBufferOffsetAlignment = 4096;
       pCapabilities->minBitstreamBufferSizeAlignment = 4096;
 
       pCapabilities->maxDpbSlots = ANV_VIDEO_H265_MAX_NUM_REF_FRAME;
-      pCapabilities->maxActiveReferencePictures = ANV_VIDEO_H265_MAX_NUM_REF_FRAME;
+      pCapabilities->maxActiveReferencePictures = 4;
       pCapabilities->pictureAccessGranularity.width = ANV_MAX_H265_CTB_SIZE;
       pCapabilities->pictureAccessGranularity.height = ANV_MAX_H265_CTB_SIZE;
-      pCapabilities->minCodedExtent.width = ANV_MAX_H265_CTB_SIZE;
-      pCapabilities->minCodedExtent.height = ANV_MAX_H265_CTB_SIZE;
+      pCapabilities->minCodedExtent.width =
+         pdevice->info.platform == INTEL_PLATFORM_BMG ? 128 : ANV_MAX_H265_CTB_SIZE;
+      pCapabilities->minCodedExtent.height =
+         pdevice->info.platform == INTEL_PLATFORM_BMG ? 128 : ANV_MAX_H265_CTB_SIZE;
 
       strcpy(pCapabilities->stdHeaderVersion.extensionName, VK_STD_VULKAN_VIDEO_CODEC_H265_ENCODE_EXTENSION_NAME);
       pCapabilities->stdHeaderVersion.specVersion = VK_STD_VULKAN_VIDEO_CODEC_H265_ENCODE_SPEC_VERSION;
@@ -638,7 +792,9 @@ anv_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
             }
          }
 
-         if (profile->lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR) {
+         if (profile->lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR &&
+             profile->videoCodecOperation != VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR &&
+             profile->videoCodecOperation != VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
             vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p) {
                p->format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
                p->imageCreateFlags = supportedImageCreateFlags;
@@ -736,6 +892,16 @@ get_h265_video_mem_size(struct anv_video_session *vid, uint32_t mem_idx)
       uint32_t width_in_max_lcu =
          DIV_ROUND_UP(vid->vk.max_coded.width, ANV_MAX_H265_CTB_SIZE);
       return align64((uint64_t)width_in_max_lcu * 64 * 2 * 2, 4096);
+   }
+   case ANV_VID_MEM_H265_VDENC_TILE_ROW_STORE: {
+      /* media-driver: (width / 32) * cacheline * 2 */
+      uint32_t width_in_32 = DIV_ROUND_UP(vid->vk.max_coded.width, 32);
+      return align64((uint64_t)width_in_32 * 64 * 2, 4096);
+   }
+   case ANV_VID_MEM_H265_VDENC_CUMULATIVE_CU_COUNT: {
+      uint32_t w_lcu = DIV_ROUND_UP(vid->vk.max_coded.width, ANV_MAX_H265_CTB_SIZE);
+      uint32_t h_lcu = DIV_ROUND_UP(vid->vk.max_coded.height, ANV_MAX_H265_CTB_SIZE);
+      return align64((uint64_t)w_lcu * h_lcu * 4, 4096);
    }
    default:
       UNREACHABLE("unknown memory");
@@ -1219,38 +1385,49 @@ anv_BindVideoSessionMemoryKHR(VkDevice _device,
    return VK_SUCCESS;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-anv_GetEncodedVideoSessionParametersKHR(VkDevice device,
-                                        const VkVideoEncodeSessionParametersGetInfoKHR* pVideoSessionParametersInfo,
-                                        VkVideoEncodeSessionParametersFeedbackInfoKHR* pFeedbackInfo,
-                                        size_t *pDataSize,
-                                        void *pData)
+static size_t
+anv_get_encoded_video_session_parameters(struct vk_video_session_parameters *params,
+                                         const VkVideoEncodeSessionParametersGetInfoKHR *pVideoSessionParametersInfo,
+                                         VkVideoEncodeSessionParametersFeedbackInfoKHR *pFeedbackInfo,
+                                         size_t size_limit, void *pData)
 {
-   VK_FROM_HANDLE(vk_video_session_parameters, params,
-                  pVideoSessionParametersInfo->videoSessionParameters);
    size_t total_size = 0;
-   size_t size_limit = 0;
-
-   if (pData)
-      size_limit = *pDataSize;
+   const struct anv_video_session_parameters *anv_params =
+      container_of(params, struct anv_video_session_parameters, vk);
+   if (pFeedbackInfo)
+      pFeedbackInfo->hasOverrides = false;
 
    switch (params->op) {
    case VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR: {
       const struct VkVideoEncodeH264SessionParametersGetInfoKHR *h264_get_info =
          vk_find_struct_const(pVideoSessionParametersInfo->pNext, VIDEO_ENCODE_H264_SESSION_PARAMETERS_GET_INFO_KHR);
       size_t sps_size = 0, pps_size = 0;
+      if (pFeedbackInfo) {
+         bool sps_override = h264_get_info->writeStdSPS &&
+            anv_params->sps_overrides[h264_get_info->stdSPSId];
+         bool pps_override = h264_get_info->writeStdPPS &&
+            anv_params->pps_overrides[h264_get_info->stdPPSId];
+         pFeedbackInfo->hasOverrides = sps_override || pps_override;
+         VkVideoEncodeH264SessionParametersFeedbackInfoKHR *feedback =
+            vk_find_struct(pFeedbackInfo->pNext, VIDEO_ENCODE_H264_SESSION_PARAMETERS_FEEDBACK_INFO_KHR);
+         if (feedback) {
+            feedback->hasStdSPSOverrides = sps_override;
+            feedback->hasStdPPSOverrides = pps_override;
+         }
+      }
       if (h264_get_info->writeStdSPS) {
          for (unsigned i = 0; i < params->h264_enc.h264_sps_count; i++)
             if (params->h264_enc.h264_sps[i].base.seq_parameter_set_id == h264_get_info->stdSPSId)
                vk_video_encode_h264_sps(&params->h264_enc.h264_sps[i].base, size_limit, &sps_size, pData);
       }
       if (h264_get_info->writeStdPPS) {
-         char *data_ptr = pData ? (char *)pData + sps_size : NULL;
+         size_t remaining = size_limit - MIN2(size_limit, sps_size);
+         char *data_ptr = remaining ? (char *)pData + sps_size : NULL;
          for (unsigned i = 0; i < params->h264_enc.h264_pps_count; i++)
             if (params->h264_enc.h264_pps[i].base.pic_parameter_set_id == h264_get_info->stdPPSId) {
                vk_video_encode_h264_pps(&params->h264_enc.h264_pps[i].base,
                                         params->h264_enc.profile_idc == STD_VIDEO_H264_PROFILE_IDC_HIGH,
-                                        size_limit, &pps_size, data_ptr);
+                                        remaining, &pps_size, data_ptr);
             }
       }
       total_size = sps_size + pps_size;
@@ -1260,23 +1437,40 @@ anv_GetEncodedVideoSessionParametersKHR(VkDevice device,
       const struct VkVideoEncodeH265SessionParametersGetInfoKHR *h265_get_info =
          vk_find_struct_const(pVideoSessionParametersInfo->pNext, VIDEO_ENCODE_H265_SESSION_PARAMETERS_GET_INFO_KHR);
       size_t sps_size = 0, pps_size = 0, vps_size = 0;
+      if (pFeedbackInfo) {
+         bool sps_override = h265_get_info->writeStdSPS &&
+            anv_params->sps_overrides[h265_get_info->stdSPSId];
+         bool pps_override = h265_get_info->writeStdPPS &&
+            anv_params->pps_overrides[h265_get_info->stdPPSId];
+         pFeedbackInfo->hasOverrides = sps_override || pps_override;
+         VkVideoEncodeH265SessionParametersFeedbackInfoKHR *feedback =
+            vk_find_struct(pFeedbackInfo->pNext, VIDEO_ENCODE_H265_SESSION_PARAMETERS_FEEDBACK_INFO_KHR);
+         if (feedback) {
+            feedback->hasStdVPSOverrides = false;
+            feedback->hasStdSPSOverrides = sps_override;
+            feedback->hasStdPPSOverrides = pps_override;
+         }
+      }
       if (h265_get_info->writeStdVPS) {
          for (unsigned i = 0; i < params->h265_enc.h265_vps_count; i++)
             if (params->h265_enc.h265_vps[i].base.vps_video_parameter_set_id == h265_get_info->stdVPSId)
                vk_video_encode_h265_vps(&params->h265_enc.h265_vps[i].base, size_limit, &vps_size, pData);
       }
       if (h265_get_info->writeStdSPS) {
-         char *data_ptr = pData ? (char *)pData + vps_size : NULL;
+         size_t remaining = size_limit - MIN2(size_limit, vps_size);
+         char *data_ptr = remaining ? (char *)pData + vps_size : NULL;
          for (unsigned i = 0; i < params->h265_enc.h265_sps_count; i++)
             if (params->h265_enc.h265_sps[i].base.sps_seq_parameter_set_id == h265_get_info->stdSPSId) {
-               vk_video_encode_h265_sps(&params->h265_enc.h265_sps[i].base, size_limit, &sps_size, data_ptr);
+               vk_video_encode_h265_sps(&params->h265_enc.h265_sps[i].base, remaining, &sps_size, data_ptr);
             }
       }
       if (h265_get_info->writeStdPPS) {
-         char *data_ptr = pData ? (char *)pData + vps_size + sps_size : NULL;
+         size_t prefix_size = vps_size + sps_size;
+         size_t remaining = size_limit - MIN2(size_limit, prefix_size);
+         char *data_ptr = remaining ? (char *)pData + prefix_size : NULL;
          for (unsigned i = 0; i < params->h265_enc.h265_pps_count; i++)
-            if (params->h265_enc.h265_pps[i].base.pps_seq_parameter_set_id == h265_get_info->stdPPSId) {
-               vk_video_encode_h265_pps(&params->h265_enc.h265_pps[i].base, size_limit, &pps_size, data_ptr);
+            if (params->h265_enc.h265_pps[i].base.pps_pic_parameter_set_id == h265_get_info->stdPPSId) {
+               vk_video_encode_h265_pps(&params->h265_enc.h265_pps[i].base, remaining, &pps_size, data_ptr);
             }
       }
       total_size = sps_size + pps_size + vps_size;
@@ -1290,14 +1484,33 @@ anv_GetEncodedVideoSessionParametersKHR(VkDevice device,
       break;
    }
 
-   /* vk_video_encode_h26x functions support to be safe even if size_limit is not enough,
-    * so we could just confirm whether pDataSize is valid afterwards.
+   return total_size;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+anv_GetEncodedVideoSessionParametersKHR(VkDevice device,
+                                        const VkVideoEncodeSessionParametersGetInfoKHR *pVideoSessionParametersInfo,
+                                        VkVideoEncodeSessionParametersFeedbackInfoKHR *pFeedbackInfo,
+                                        size_t *pDataSize, void *pData)
+{
+   VK_FROM_HANDLE(vk_video_session_parameters, params,
+                  pVideoSessionParametersInfo->videoSessionParameters);
+
+   /* Query the complete size before writing. The bitstream writer stops on
+    * overflow, so its byte count after a truncated write is not the size
+    * required for all requested parameter sets.
     */
+   size_t total_size = anv_get_encoded_video_session_parameters(
+      params, pVideoSessionParametersInfo, pFeedbackInfo, 0, NULL);
    if (pData && *pDataSize < total_size) {
       *pDataSize = 0;
       return VK_INCOMPLETE;
    }
 
+   if (pData) {
+      total_size = anv_get_encoded_video_session_parameters(
+         params, pVideoSessionParametersInfo, NULL, *pDataSize, pData);
+   }
    *pDataSize = total_size;
    return VK_SUCCESS;
 }
@@ -1640,9 +1853,15 @@ anv_video_get_image_mv_size(struct anv_device *device,
          size = w_mb * h_mb * 128;
       } else if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR ||
                  profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
-         unsigned w_mb = DIV_ROUND_UP(image->vk.extent.width, 32);
-         unsigned h_mb = DIV_ROUND_UP(image->vk.extent.height, 32);
-         size = align(w_mb * h_mb, 2) << 6;
+         /* media-driver HevcBasicFeature::UpdateTrackedBufferParameters:
+          * MAX of 64x16 (mvt) and 32x32 (mvtb) grids. VDENC P-frames use the
+          * larger layout; the old 32x32-only size is too small on CIF.
+          */
+         uint32_t w = image->vk.extent.width;
+         uint32_t h = image->vk.extent.height;
+         uint32_t mvt = align(((w + 63) >> 6) * ((h + 15) >> 4), 2) << 6;
+         uint32_t mvtb = align(((w + 31) >> 5) * ((h + 31) >> 5), 2) << 6;
+         size = MAX2(mvt, mvtb);
       } else if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR) {
          unsigned w_ctb = DIV_ROUND_UP(image->vk.extent.width, ANV_MAX_VP9_CTB_SIZE);
          unsigned h_ctb = DIV_ROUND_UP(image->vk.extent.height, ANV_MAX_VP9_CTB_SIZE);

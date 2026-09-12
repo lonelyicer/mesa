@@ -926,6 +926,51 @@ add_aux_surface_if_supported(struct anv_device *device,
    return VK_SUCCESS;
 }
 
+/* media-driver encode_hevc_basic_feature: 4x size in 16x16 MBs, height
+ * padded for Y-tile (32) then doubled; 8x is half of that, re-padded.
+ */
+static void
+anv_vdenc_hevc_ds_extent(uint32_t coded_w, uint32_t coded_h,
+                         uint32_t *w4, uint32_t *h4,
+                         uint32_t *w8, uint32_t *h8)
+{
+   uint32_t mbw = DIV_ROUND_UP(DIV_ROUND_UP(coded_w, 4), 16);
+   uint32_t mbh = DIV_ROUND_UP(DIV_ROUND_UP(coded_h, 4), 16);
+   *w4 = mbw * 16;
+   *h4 = align(((mbh + 1) >> 1) * 16, 32) << 1;
+   *w8 = *w4 >> 1;
+   *h8 = align(*h4 >> 1, 32) << 1;
+}
+
+static VkResult
+add_vdenc_ds_surface(struct anv_device *device, struct anv_image *image,
+                     uint32_t luma_w, uint32_t luma_h,
+                     struct anv_surface *surf)
+{
+   /* Packed NV12: luma then chroma, UV at row luma_h. */
+   const uint32_t nv12_h = luma_h + DIV_ROUND_UP(luma_h, 2);
+   bool ok = isl_surf_init(&device->isl_dev, &surf->isl,
+      .dim = ISL_SURF_DIM_2D,
+      .format = ISL_FORMAT_R8_UNORM,
+      .width = luma_w,
+      .height = nv12_h,
+      .depth = 1,
+      .levels = 1,
+      .array_len = image->vk.array_layers,
+      .samples = 1,
+      .min_alignment_B = 0,
+      .row_pitch_B = 0,
+      .usage = ISL_SURF_USAGE_VIDEO_DECODE_BIT |
+               ISL_SURF_USAGE_DISABLE_AUX_BIT,
+      .tiling_flags = ISL_TILING_ANY_MASK);
+
+   if (!ok)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   return add_surface(device, image, surf, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
+                      ANV_OFFSET_IMPLICIT);
+}
+
 static VkResult
 add_video_buffers(struct anv_device *device,
                   struct anv_image *image,
@@ -944,47 +989,86 @@ add_video_buffers(struct anv_device *device,
       size = anv_video_get_image_mv_size(device, image, profile_list);
    }
 
-   if (size == 0)
-      return VK_SUCCESS;
+   ok = VK_SUCCESS;
 
-   if (image->vk.array_layers > 1) {
-      image->vid_dmv_top_surface_pitch_B = align(size, 64);
-      size = image->vid_dmv_top_surface_pitch_B *
-               (image->vk.array_layers - 1) + size;
-   } else {
-      image->vid_dmv_top_surface_pitch_B = size;
+   if (size > 0) {
+      if (image->vk.array_layers > 1) {
+         image->vid_dmv_top_surface_pitch_B = align(size, 64);
+         size = image->vid_dmv_top_surface_pitch_B *
+                  (image->vk.array_layers - 1) + size;
+      } else {
+         image->vid_dmv_top_surface_pitch_B = size;
+      }
+
+      ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
+                              ANV_OFFSET_IMPLICIT, size, 64, &image->vid_dmv_top_surface);
+      if (ok != VK_SUCCESS)
+         return ok;
+
+      size = av1_cdf_max_num_bytes;
+
+      if (image->vk.array_layers > 1) {
+         image->av1_cdf_table_pitch_B = align(size, 64);
+         size = image->av1_cdf_table_pitch_B *
+                  (image->vk.array_layers - 1) + size;
+      } else {
+         image->av1_cdf_table_pitch_B = size;
+      }
+
+      /* Doesn't work for av1 without provided profiles */
+      if (!independent_profile) {
+         for (unsigned i = 0; i < profile_list->profileCount; i++) {
+            if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR ||
+                profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR) {
+               ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
+                                       ANV_OFFSET_IMPLICIT, size, 4096, &image->av1_cdf_table);
+            }
+         }
+      } else {
+         /* Nothing to check if it's AV1 decoding, so we need to allocate av1
+          * tables all the time.
+          */
+         ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
+                                 ANV_OFFSET_IMPLICIT, size, 4096, &image->av1_cdf_table);
+      }
+
+      if (ok != VK_SUCCESS)
+         return ok;
    }
 
-   ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
-                           ANV_OFFSET_IMPLICIT, size, 64, &image->vid_dmv_top_surface);
-   if (ok != VK_SUCCESS)
-      return ok;
-
-   size = av1_cdf_max_num_bytes;
-
-   if (image->vk.array_layers > 1) {
-      image->av1_cdf_table_pitch_B = align(size, 64);
-      size = image->av1_cdf_table_pitch_B *
-               (image->vk.array_layers - 1) + size;
-   } else {
-      image->av1_cdf_table_pitch_B = size;
-   }
-
-   /* Doesn't work for av1 without provided profiles */
-   if (!independent_profile) {
-      for (unsigned i = 0; i < profile_list->profileCount; i++) {
-         if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR ||
-             profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR) {
-            ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
-                                    ANV_OFFSET_IMPLICIT, size, 4096, &image->av1_cdf_table);
+   /* HEVC VDENC always reads 4x/8x HME surfaces on inter frames. Allocate
+    * them on encode DPB images so P-frames have somewhere to prefetch.
+    */
+   bool h265_enc_dpb =
+      (image->vk.usage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR) != 0;
+   if (h265_enc_dpb && !independent_profile) {
+      h265_enc_dpb = false;
+      if (profile_list) {
+         for (unsigned i = 0; i < profile_list->profileCount; i++) {
+            if (profile_list->pProfiles[i].videoCodecOperation ==
+                VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR)
+               h265_enc_dpb = true;
          }
       }
-   } else {
-      /* Nothing to check if it's AV1 decoding, so we need to allocate av1
-       * tables all the time.
-       */
-      ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
-                              ANV_OFFSET_IMPLICIT, size, 4096, &image->av1_cdf_table);
+   }
+
+   if (h265_enc_dpb) {
+      uint32_t w4, h4, w8, h8;
+      anv_vdenc_hevc_ds_extent(image->vk.extent.width, image->vk.extent.height,
+                               &w4, &h4, &w8, &h8);
+      if (w4 >= 8 && h4 >= 8 && w8 >= 8 && h8 >= 8) {
+         image->vid_vdenc_ds4x_width = w4;
+         image->vid_vdenc_ds4x_height = h4;
+         image->vid_vdenc_ds8x_width = w8;
+         image->vid_vdenc_ds8x_height = h8;
+
+         ok = add_vdenc_ds_surface(device, image, w8, h8, &image->vid_vdenc_ds8x);
+         if (ok != VK_SUCCESS)
+            return ok;
+         ok = add_vdenc_ds_surface(device, image, w4, h4, &image->vid_vdenc_ds4x);
+         if (ok != VK_SUCCESS)
+            return ok;
+      }
    }
 
    return ok;

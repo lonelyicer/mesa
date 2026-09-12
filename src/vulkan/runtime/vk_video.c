@@ -304,7 +304,7 @@ vk_video_deep_copy_h265_pps(struct vk_video_h265_pps *dst,
                                                                         \
    static VkResult update_##SS##_##SET(struct vk_video_session_parameters *params, \
                                        uint32_t count, const PARAMSET *updates) { \
-      if (params->SS.SET##_count + count >= params->SS.max_##SET##_count) \
+      if (params->SS.SET##_count + count > params->SS.max_##SET##_count)  \
          return VK_ERROR_TOO_MANY_OBJECTS;                              \
       for (unsigned _c = 0; _c < count; _c++)                           \
          vk_video_deep_copy_##SET(&params->SS.SET[params->SS.SET##_count + _c], &updates[_c]); \

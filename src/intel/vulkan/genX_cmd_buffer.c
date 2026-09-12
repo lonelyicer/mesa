@@ -5565,6 +5565,20 @@ cmd_buffer_accumulate_barrier_bits(struct anv_cmd_buffer *cmd_buffer,
          VkImageLayout old_layout = img_barrier->oldLayout;
          VkImageLayout new_layout = img_barrier->newLayout;
 
+         /* SteamVR Link 2.17.9 releases sampled external images back to
+          * UNDEFINED, violating VUID-VkImageMemoryBarrier-newLayout-01198.
+          * Return them in GENERAL, the layout used for external interop,
+          * while retaining the memory dependencies and ownership release.
+          */
+         if (device->physical->drirc.debug.fixup_invalid_external_release &&
+             old_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+             new_layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+             img_barrier->dstQueueFamilyIndex == VK_QUEUE_FAMILY_EXTERNAL &&
+             image->vk.external_handle_types != 0 &&
+             range->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
+            new_layout = VK_IMAGE_LAYOUT_GENERAL;
+         }
+
          /* If we're inside a render pass, the runtime might have converted
           * some layouts from GENERAL to FEEDBACK_LOOP. Check if that's the
           * case and reconvert back to the original layout so that application
