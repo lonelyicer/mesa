@@ -384,7 +384,7 @@ anv_vdenc_emit_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
       vdenc_buf.DSFWDREF0.PictureFields = ANV_VID_PIC(cmd->device, p->ds_fwd_ref[0].bo);
       vdenc_buf.DSFWDREF1.Address = p->ds_fwd_ref[1];
       vdenc_buf.DSFWDREF1.PictureFields = ANV_VID_PIC(cmd->device, p->ds_fwd_ref[1].bo);
-#if GFX_VERx10 == 125
+#if GFX_VERx10 >= 125
       vdenc_buf.DSBWDREF0.Address = p->ds_bwd_ref;
       vdenc_buf.DSBWDREF0.PictureFields = ANV_VID_PIC(cmd->device, p->ds_bwd_ref.bo);
 #endif
@@ -456,7 +456,7 @@ anv_vdenc_emit_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
          ANV_VID_PIC(cmd->device, NULL);
 #endif
 
-#if GFX_VERx10 == 125
+#if GFX_VERx10 >= 125
       vdenc_buf.IntraPredictionRowStoreBuffer.PictureFields =
          ANV_VID_PIC(cmd->device, NULL);
       vdenc_buf.ColocatedMVAVCWriteBuffer.Address = p->col_mv_avc_write;
@@ -853,7 +853,7 @@ anv_h264_emit_vdenc_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
    struct anv_video_session *vid = cmd->video.vid;
    const struct anv_image_view *iv =
       anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-#if GFX_VERx10 == 125
+#if GFX_VERx10 >= 125
    uint32_t base_ref_array_layer;
    const struct anv_image_view *base_ref_iv =
       anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
@@ -899,13 +899,13 @@ anv_h264_emit_vdenc_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
       if (colloc_rd_en)
          buf.col_mv_read =
                anv_image_dmv_top_address(l1_iv, l1_slot->pPictureResource->baseArrayLayer);
-#if GFX_VERx10 == 125
+#if GFX_VERx10 >= 125
       buf.ds_bwd_ref =
             anv_image_ds_4x_address(l1_iv, l1_slot->pPictureResource->baseArrayLayer);
 #endif
    }
 
-#if GFX_VERx10 == 125
+#if GFX_VERx10 >= 125
    if (enc_info->pSetupReferenceSlot)
       buf.col_mv_avc_write =
          anv_image_dmv_top_address(base_ref_iv, base_ref_array_layer);
@@ -1147,6 +1147,40 @@ anv_h264_emit_vdenc_avc_img_state(struct anv_cmd_buffer *cmd,
     * TODO: the rest, intra-refresh / A-stepping / Wa_18011246551 / stream-in
     * are all 0 for now.
     */
+   uint32_t level = vk_video_get_h264_level(sps->level_idc);
+
+#if GFX_VER >= 20
+   /* Xe2 HPG (BMG) programs the full 26 dword command, with the tuning values
+    * from media-driver's Xe2_HPM AVC const settings.  Target usage 4
+    * (Normal/Balanced), slice level rate control and low delay mode off, and
+    * the current picture is a reference when a setup slot is given.
+    */
+   const uint32_t tu = 4;
+   const uint32_t ref_pic_flag = enc_info->pSetupReferenceSlot != NULL;
+   const uint32_t type_idx = !is_inter ? 0 : !is_bframe ? 1 : 2;
+
+   uint32_t *dw = anv_batch_emitn(batch, GENX(VDENC_AVC_IMG_STATE_length),
+                                  GENX(VDENC_AVC_IMG_STATE));
+   GENX(VDENC_AVC_IMG_STATE_pack)(batch, dw, &img);
+
+   dw[1]  |= xe2_h264_vdenc_avc_img_state_dw1;
+   dw[2]  |= xe2_h264_vdenc_avc_img_state_dw2[type_idx][tu][ref_pic_flag][0];
+   dw[5]  |= xe2_h264_vdenc_avc_img_state_dw5[type_idx][tu];
+   dw[7]  |= xe2_h264_vdenc_avc_img_state_dw7;
+   dw[8]  |= level <= 52 ? xe2_h264_vdenc_avc_img_state_dw8[level] : 0x02002000;
+   dw[10] |= xe2_h264_vdenc_avc_img_state_dw10[type_idx];
+   dw[11] |= xe2_h264_vdenc_avc_img_state_dw11[type_idx];
+   dw[12] |= xe2_h264_vdenc_avc_img_state_dw12[type_idx][tu];
+   dw[13] |= xe2_h264_vdenc_avc_img_state_dw13[type_idx][tu][0];
+   dw[14] |= xe2_h264_vdenc_avc_img_state_dw14[type_idx][tu];
+   dw[15] |= xe2_h264_vdenc_avc_img_state_dw15;
+   dw[16] |= xe2_h264_vdenc_avc_img_state_dw16;
+   dw[17] |= xe2_h264_vdenc_avc_img_state_dw17;
+   dw[18] |= xe2_h264_vdenc_avc_img_state_dw18;
+   dw[19] |= xe2_h264_vdenc_avc_img_state_dw19;
+   dw[22] |= xe2_h264_vdenc_avc_img_state_dw22;
+   dw[25] |= xe2_h264_vdenc_avc_img_state_dw25[tu];
+#else
    uint8_t img_type = !is_inter ? 0 : !is_bframe ? 1 :
                       (enc_info->pSetupReferenceSlot ? 3 : 2);
    const uint32_t *cost = h264_vdenc_avc_img_state[4 - 1][img_type][0][0][0][0];
@@ -1156,9 +1190,9 @@ anv_h264_emit_vdenc_avc_img_state(struct anv_cmd_buffer *cmd,
    for (unsigned i = 0; i < 19; i++)
       dw[i + 1] |= cost[i];
 
-   uint32_t level = vk_video_get_h264_level(sps->level_idc);
    dw[8] = (dw[8] & 0xffff) |
            (level <= 52 ? h264_vdenc_avc_img_state_dw8[level] : 0x02000000);
+#endif
 }
 #endif
 
@@ -2592,7 +2626,7 @@ anv_h265_emit_vdenc_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
       buf.bwd_ref =
             anv_image_dpb_address(bwd_ref_iv, bwd_ref_layer);
 
-#if GFX_VERx10 == 125
+#if GFX_VERx10 >= 125
    const struct anv_image_view *ds_ref_iv[2] = { ref_iv[0], ref_iv[1] };
    uint32_t ds_ref_layer[2] = { ref_layer[0], ref_layer[1] };
 #else
@@ -2614,7 +2648,7 @@ anv_h265_emit_vdenc_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
       buf.ds_fwd_ref_4x[i] = anv_image_ds_4x_address(ds_ref_iv[i], ds_ref_layer[i]);
    }
 
-#if GFX_VERx10 == 125
+#if GFX_VERx10 >= 125
    if (bwd_ref_iv) {
       buf.ds_bwd_ref = anv_image_ds_8x_address(bwd_ref_iv, bwd_ref_layer);
       buf.ds_bwd_ref_4x = anv_image_ds_4x_address(bwd_ref_iv, bwd_ref_layer);

@@ -1,4 +1,27 @@
+/*
+* Copyright (c) 2024, Intel Corporation
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included
+* in all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+* OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+* OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+* ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+* OTHER DEALINGS IN THE SOFTWARE.
+*/
+
 #ifndef _H264_VDENC_TABLES_H_
+#define _H264_VDENC_TABLES_H_
 
 #if GFX_VERx10 < 125
 static const uint8_t vdenc_const_qp_lambda[42] = {
@@ -1461,5 +1484,128 @@ static const uint32_t h264_vdenc_avc_img_state_dw8[53] = {
 };
 
 #endif /* GFX_VERx10 >= 125 */
+
+#if GFX_VER >= 20
+/* Xe2 HPG (BMG) VDENC_AVC_IMG_STATE lookup tables, from media-driver
+ * encode_avc_vdenc_const_settings_xe2_hpm_open.h. The values are ORed on
+ * top of the named fields. Index order follows media-driver:
+ *   dw2:  [coding type - 1][target usage][ref pic flag][slice level rate ctrl]
+ *   dw5, dw12, dw14: [coding type - 1][target usage]
+ *   dw8:  [level_idc]
+ *   dw10, dw11: [coding type - 1]
+ *   dw13: [coding type - 1][target usage][low delay mode]
+ *   dw25: [target usage]
+ * The intra refresh only dw4 table is not carried over, its entries for
+ * the disabled case are all zero.
+ */
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw1 = 0x00000301;
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw7 = 0xffff0000;
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw15 = 0x0bb80002;
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw16 = 0x0e100004;
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw17 = 0x13880006;
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw18 = 0x1f40000a;
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw19 = 0x23280012;
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw22 = 0x33000000;
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw2[3][8][2][2] = {
+   {
+      { {0x70028000,0x70028000}, {0x70028000,0x70028000} },
+      { {0xc0029400,0xc0029400}, {0xc0029400,0xc0029400} },
+      { {0x70029400,0x70029400}, {0x70029400,0x70029400} },
+      { {0x40028240,0x40028240}, {0x40028240,0x40028240} },
+      { {0x40028240,0x40028240}, {0x40028240,0x40028240} },
+      { {0x40028240,0x40028240}, {0x40028240,0x40028240} },
+      { {0x400281e0,0x40028160}, {0x400281e0,0x40028160} },
+      { {0x400281e0,0x40028160}, {0x400281e0,0x40028160} },
+   },
+   {
+      { {0x70028000,0x70028000}, {0x70028000,0x70028000} },
+      { {0xc0029407,0xc0029407}, {0xc0029407,0xc0029407} },
+      { {0x70029407,0x70029407}, {0x70029407,0x70029407} },
+      { {0x40028247,0x40028247}, {0x40028247,0x40028247} },
+      { {0x40028247,0x40028247}, {0x40028247,0x40028247} },
+      { {0x40028247,0x40028247}, {0x40028247,0x40028247} },
+      { {0x400281e4,0x40028164}, {0x400281e4,0x40028164} },
+      { {0x400281e4,0x40028164}, {0x400281e4,0x40028164} },
+   },
+   {
+      { {0x70028000,0x70028000}, {0x70028000,0x70028000} },
+      { {0xc0029407,0xc0029407}, {0xc0029407,0xc0029407} },
+      { {0x70029407,0x70029407}, {0x72029207,0x72029207} },
+      { {0x40028244,0x40028244}, {0x40028244,0x40028244} },
+      { {0x40028243,0x40028243}, {0x40028243,0x40028243} },
+      { {0x40028243,0x40028243}, {0x40028243,0x40028243} },
+      { {0x400281e2,0x40028162}, {0x400281e2,0x40028162} },
+      { {0x400281e2,0x40028162}, {0x400281e2,0x40028162} },
+   },
+};
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw5[3][8] = {
+   { 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
+   { 0x00000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000 },
+   { 0x00000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000 },
+};
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw8[53] = {
+   0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000,
+   0x02002000, 0x01002000, 0x01002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000,
+   0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x04002000, 0x04002000, 0x02002000,
+   0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x04002000, 0x08002000,
+   0x08002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000,
+   0x08002000, 0x08002000, 0x08002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000, 0x02002000,
+   0x02002000, 0x02002000, 0x08002000, 0x08002000, 0x08002000,
+};
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw10[3] = { 0x03e80000, 0x03200000, 0x02580000 };
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw11[3] = { 0x0bb807d0, 0x09600640, 0x070804b0 };
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw12[3][8] = {
+   { 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000 },
+   { 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0fff0000, 0x0fff0000 },
+   { 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0f000000, 0x0fff0000, 0x0fff0000 },
+};
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw13[3][8][2] = {
+   {
+      { 0x07d00000, 0x07d00000 },
+      { 0x07d00000, 0x07d00000 },
+      { 0x07d00000, 0x07d00000 },
+      { 0x07d00000, 0x07d00000 },
+      { 0x07d00000, 0x07d00000 },
+      { 0x07d00000, 0x07d00000 },
+      { 0x07d00000, 0x07d00000 },
+      { 0x07d00000, 0x07d00000 },
+   },
+   {
+      { 0x06400000, 0x06400000 },
+      { 0x06400000, 0x064000c0 },
+      { 0x06400000, 0x06400000 },
+      { 0x06400000, 0x06400000 },
+      { 0x06400000, 0x06400000 },
+      { 0x06400000, 0x06400000 },
+      { 0x06400000, 0x06400000 },
+      { 0x06400000, 0x06400000 },
+   },
+   {
+      { 0x04b00000, 0x04b00000 },
+      { 0x04b000c0, 0x04b000c0 },
+      { 0x04b00000, 0x04b00000 },
+      { 0x04b00000, 0x04b00000 },
+      { 0x04b00000, 0x04b00000 },
+      { 0x04b00000, 0x04b00000 },
+      { 0x04b00000, 0x04b00000 },
+      { 0x04b00000, 0x04b00000 },
+   },
+};
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw14[3][8] = {
+   { 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xff200000 },
+   { 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xffe00000, 0xffe00000 },
+   { 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xff200000, 0xffe00000, 0xffe00000 },
+};
+
+static const uint32_t xe2_h264_vdenc_avc_img_state_dw25[8] = { 0x006000c0, 0x006000c0, 0x00000000, 0x006000c0, 0x006000c0, 0x006000c0, 0x006000c0, 0x006000c0 };
+#endif
 
 #endif
