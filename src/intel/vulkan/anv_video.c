@@ -612,25 +612,8 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       enc_caps->rateControlModes = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR |
                                    VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
 
-      /* Only the HEVC path is wired to the HuC BRC: the H.264 BRC needs the
-       * AVC SLB execution path debugged before it produces useful QPs, so keep
-       * CBR/VBR unadvertised for it instead of promising rate control the
-       * encoder does not apply.
-       */
-      /* Only the HEVC path is wired to the HuC BRC: the H.264 BRC needs the
-       * AVC init DMEM corrected before it produces useful QPs (the update
-       * kernel faults on the second frame), so keep CBR/VBR unadvertised for
-       * it instead of promising rate control the encoder does not apply.
-       */
-      /* Only the HEVC path is wired to the HuC BRC: the H.264 BRC still loses
-       * the device on the second frame (the AVC init DMEM differs from
-       * media-driver's in the GOP and rate threshold tables), so keep CBR/VBR
-       * unadvertised for it rather than promising rate control the encoder
-       * does not apply.
-       */
-      /* Only the HEVC path is wired to the HuC BRC: the H.264 BRC still loses
-       * the device on the second frame, so keep CBR/VBR unadvertised for it
-       * rather than promising rate control the encoder does not apply.
+      /* Only advertise HuC rate control on the validated HEVC platforms.
+       * The AVC and BMG BRC paths are not ready for application use.
        */
       if (pVideoProfile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR &&
           anv_video_encode_brc_supported(pdevice)) {
@@ -642,16 +625,12 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       enc_caps->maxQualityLevels = 1;
       enc_caps->encodeInputPictureGranularity.width = 32;
       enc_caps->encodeInputPictureGranularity.height = 32;
+      /* feedback2 is not exposed: its statistics must come from the encode
+       * result, not estimates based on the requested QP and picture type.
+       */
       enc_caps->supportedEncodeFeedbackFlags =
          VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BUFFER_OFFSET_BIT_KHR |
-         VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR |
-         VK_VIDEO_ENCODE_FEEDBACK_AVERAGE_QUANTIZATION_BIT_KHR |
-         VK_VIDEO_ENCODE_FEEDBACK_MIN_QUANTIZATION_BIT_KHR |
-         VK_VIDEO_ENCODE_FEEDBACK_MAX_QUANTIZATION_BIT_KHR |
-         VK_VIDEO_ENCODE_FEEDBACK_INTRA_PIXELS_BIT_KHR |
-         VK_VIDEO_ENCODE_FEEDBACK_INTER_PIXELS_BIT_KHR |
-         VK_VIDEO_ENCODE_FEEDBACK_SKIPPED_PIXELS_BIT_KHR |
-         VK_VIDEO_ENCODE_FEEDBACK_PICTURE_PARTITION_COUNT_BIT_KHR;
+         VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR;
 
       struct VkVideoEncodeFeedback2CapabilitiesKHR *feedback2_caps =
          vk_find_struct(pCapabilities->pNext, VIDEO_ENCODE_FEEDBACK_2_CAPABILITIES_KHR);
@@ -1850,7 +1829,7 @@ anv_GetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR(VkPhysicalDevice physi
       ext->preferredGopFrameCount = 60;
       /* For Low-Power(VDENC) mode */
       ext->preferredMaxL0ReferenceCount = 3;
-      ext->preferredMaxL1ReferenceCount = 3;
+      ext->preferredMaxL1ReferenceCount = 1;
       ext->preferredConstantQp = (VkVideoEncodeH265QpKHR) { 26, 26, 26 };
       break;
    }
