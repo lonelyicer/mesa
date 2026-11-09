@@ -1942,18 +1942,21 @@ static void
 anv_vdenc_fill_hevc_ds_surface(struct GENX(VDENC_SURFACE_STATE_FIELDS) *ss,
                                const struct anv_image *img, bool is_8x)
 {
-   const struct anv_surface *surf =
-      is_8x ? &img->vid_vdenc_ds8x : &img->vid_vdenc_ds4x;
-   const uint32_t w = is_8x ? img->vid_vdenc_ds8x_width : img->vid_vdenc_ds4x_width;
-   const uint32_t h = is_8x ? img->vid_vdenc_ds8x_height : img->vid_vdenc_ds4x_height;
+   /* The downscaled reference surfaces are allocated as a linear NV12 image,
+    * sized and laid out by anv_video_get_enc_ds_layout(). */
+   struct anv_video_enc_ds_layout ds =
+      anv_video_get_enc_ds_layout(img->vk.extent.width, img->vk.extent.height);
+   const uint32_t w = is_8x ? ds.w8 : ds.w4;
+   const uint32_t h = is_8x ? ds.h8 : ds.h4;
+   const uint32_t pitch = is_8x ? ds.pitch8 : ds.pitch4;
 
    ss->Width = w - 1;
    ss->Height = h - 1;
    ss->SurfaceFormat = VDENC_PLANAR_420_8;
-   ss->SurfacePitch = surf->isl.row_pitch_B - 1;
+   ss->SurfacePitch = pitch - 1;
    ss->TileWalk = TW_YMAJOR;
-   ss->TiledSurface = surf->isl.tiling != ISL_TILING_LINEAR;
-   /* Packed NV12: chroma starts at luma height. Must be a multiple of 16. */
+   ss->TiledSurface = true;
+   /* Packed NV12: chroma starts at luma height. */
    ss->YOffsetforUCb = h;
    ss->YOffsetforVCr = h;
 }

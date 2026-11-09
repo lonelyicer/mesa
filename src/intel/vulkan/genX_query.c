@@ -818,6 +818,15 @@ VkResult genX(GetQueryPoolResults)(
    if (pData == NULL)
       return VK_SUCCESS;
 
+   if (getenv("ANV_DEBUG_VIDEO_QUERY") && pool->codec != 0) {
+      const uint32_t *d = (const uint32_t *)pData;
+      fprintf(stderr, "VIDEO QUERY: type=%d count=%u size=%zu pData=%p",
+              (int)pool->vk.query_type, queryCount, dataSize, pData);
+      if (d && dataSize >= 8)
+         fprintf(stderr, " status=0x%08x bytes=%u", d[2], d[3]);
+      fprintf(stderr, "\n");
+   }
+
    /* If stride 0, data is tightly packed */
    if (pool->vk.query_type == VK_QUERY_TYPE_PERFORMANCE_QUERY_INTEL && stride == 0)
       stride = device->physical->perf->metrics_library.api_report_size;
