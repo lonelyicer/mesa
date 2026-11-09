@@ -247,6 +247,7 @@ libanv_files = files(
   'anv_va.c',
   'anv_video.c',
   'anv_video_brc_tables.c',
+  'anv_video_rdoq_tables.c',
   'anv_wsi.c',
   'bvh/anv_bvh_defines.h',
 )

@@ -3757,6 +3757,56 @@ anv_h265_brc_store_pak_stats(struct anv_cmd_buffer *cmd)
 
 #endif
 
+extern const uint16_t anv_h265_rdoq_lambda_8bit[2][2][2][52];
+extern const uint16_t anv_h265_rdoq_lambda_10bit[2][2][2][64];
+
+static void
+anv_h265_emit_rdoq_state(struct anv_batch *batch, bool is_intra,
+                         uint32_t bit_depth, bool disable_htq_perf)
+{
+   const uint16_t *tab;
+   uint32_t n;
+
+   if (bit_depth <= 8) {
+      tab = &anv_h265_rdoq_lambda_8bit[0][0][0][0];
+      n = 52;
+   } else if (bit_depth <= 10) {
+      tab = &anv_h265_rdoq_lambda_10bit[0][0][0][0];
+      n = 64;
+   } else {
+      /* 12 bit tables are not ported; the media-driver derives them from the
+       * same per slice type base tables beyond QP 64.
+       */
+      return;
+   }
+
+   const uint32_t slice = is_intra ? 0 : 1;
+   const uint16_t *il = tab + (((slice * 2 + 0) * 2 + 0) * n);
+   const uint16_t *ic = tab + (((slice * 2 + 0) * 2 + 1) * n);
+   const uint16_t *el = tab + (((slice * 2 + 1) * 2 + 0) * n);
+   const uint16_t *ec = tab + (((slice * 2 + 1) * 2 + 1) * n);
+
+   uint32_t *dw = anv_batch_emit_dwords(batch, 154);
+   dw[0] = 0x73880098; /* HCP, subopcode 8, length 152 */
+   dw[1] = disable_htq_perf ? 0xc0000000 : 0;
+
+   for (uint32_t i = 0; i < 32; i++) {
+      uint32_t il0 = il[2 * i], il1 = il[2 * i + 1];
+      uint32_t ic0 = ic[2 * i], ic1 = ic[2 * i + 1];
+      uint32_t el0 = el[2 * i], el1 = el[2 * i + 1];
+      uint32_t ec0 = ec[2 * i], ec1 = ec[2 * i + 1];
+
+      dw[2 + i] = il0 | (il1 << 16);
+      dw[34 + i] = ic0 | (ic1 << 16);
+      dw[66 + i] = el0 | (el1 << 16);
+      dw[98 + i] = ec0 | (ec1 << 16);
+   }
+
+   /* 12 bit lambda tables: zero for 8 and 10 bit. */
+   for (uint32_t i = 130; i < 154; i++)
+      dw[i] = 0;
+}
+
 static void
 anv_h265_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
 {
@@ -3898,6 +3948,12 @@ anv_h265_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
          anv_h265_emit_vdenc_cmd1(cmd, NULL, enc_info);
          anv_h265_emit_hcp_pic_state(cmd, NULL, enc_info);
          anv_h265_emit_vdenc_cmd2(cmd, NULL, enc_info, dpb_idx, is_low_delay);
+#if GFX_VER >= 20
+         /* Xe2 VDEnc expects the RDOQ lambda table command to be programmed. */
+         anv_h265_emit_rdoq_state(&cmd->batch,
+                                  anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0,
+                                  sps->bit_depth_luma_minus8 + 8, false);
+#endif
       }
 
       for (uint32_t slice_id = 0; slice_id < frame_info->naluSliceSegmentEntryCount; slice_id++) {
