@@ -1874,6 +1874,14 @@ extern enum anv_debug anv_debug;
 
 #define ANV_DEBUG(name) unlikely(anv_debug & ANV_DEBUG_##name)
 
+static inline bool
+anv_physical_device_has_video_encode(const struct anv_physical_device *device)
+{
+   /* Xe2: only BMG is wired up (VDEnc command set in xe2.xml). */
+   return (device->info.verx10 <= 125 && ANV_DEBUG(VIDEO_ENCODE)) ||
+          device->info.platform == INTEL_PLATFORM_BMG;
+}
+
 static inline bool anv_needs_printf_buffer(void)
 {
    return ANV_DEBUG(SHADER_PRINT) || ANV_DEBUG(DGC_DUMP);

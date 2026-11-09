@@ -857,7 +857,7 @@ anv_get_color_format_features(const struct anv_physical_device *physical_device,
                   VK_FORMAT_FEATURE_2_VIDEO_DECODE_OUTPUT_BIT_KHR |
                   VK_FORMAT_FEATURE_2_VIDEO_DECODE_DPB_BIT_KHR : 0;
 
-      flags |= ANV_DEBUG(VIDEO_ENCODE) ?
+      flags |= anv_physical_device_has_video_encode(physical_device) ?
                   VK_FORMAT_FEATURE_2_VIDEO_ENCODE_INPUT_BIT_KHR |
                   VK_FORMAT_FEATURE_2_VIDEO_ENCODE_DPB_BIT_KHR : 0;
    }
