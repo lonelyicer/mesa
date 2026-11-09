@@ -7223,6 +7223,8 @@ struct anv_video_session {
 
    bool cdf_initialized;
    VkVideoEncodeRateControlModeFlagBitsKHR rc_mode;
+   /* VK_KHR_video_encode_intra_refresh */
+   VkVideoEncodeIntraRefreshModeFlagBitsKHR intra_refresh_mode;
    struct anv_video_rc_state rc;
 
    /* the decoder needs some private memory allocations */

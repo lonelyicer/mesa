@@ -2170,6 +2170,11 @@ anv_h265_emit_hcp_pipe_mode_select(struct anv_cmd_buffer *cmd,
       sel.PAKPipelineStreamOutEnable = true;
       sel.PAKFrameLevelStreamOutEnable = true;
       sel.AdvancedRateControlEnable = brc_enabled;
+#if GFX_VER >= 20
+      /* Xe2 VDEnc RDOQ: the lambda table command is programmed, and the
+       * picture state enables RDOQ for intra transform units. */
+      sel.RDOQEnable = true;
+#endif
    }
 }
 
@@ -2663,7 +2668,19 @@ anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
                          struct anv_batch *batch,
                          const VkVideoEncodeInfoKHR *enc_info)
 {
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
+   const struct VkVideoEncodeH265PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
+   struct vk_video_session_parameters *params = cmd->video.params;
+   const StdVideoH265SequenceParameterSet *sps =
+      vk_video_find_h265_enc_std_sps(params, frame_info->pStdPictureInfo->pps_seq_parameter_set_id);
+   const StdVideoH265PictureParameterSet *pps =
+      vk_video_find_h265_enc_std_pps(params, frame_info->pStdPictureInfo->pps_pic_parameter_set_id);
+   const bool is_10bit = (sps->bit_depth_luma_minus8 == 2) || (sps->bit_depth_chroma_minus8 == 2);
+   bool rc_disable = cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+   int32_t frame_qp = rc_disable ?
+      frame_info->pNaluSliceSegmentEntries[0].constantQp :
+      pps->init_qp_minus26 + 26;
+   frame_qp = CLAMP(frame_qp, 10, 51);
 
    if (!batch)
       batch = &cmd->batch;
@@ -2671,73 +2688,36 @@ anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
 #if GFX_VERx10 >= 125
    bool is_intra =
       anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0;
-   uint32_t cmd1_qp = anv_h265_slice_qp(cmd, enc_info, 0);
-   unsigned type = is_intra ? 0 : 2;
 
-   /* TODO: Currently ANV emits only I or low delay B,
-    * Needs to handle Lambda weights for hierarchical B. (GopRefDist 4/8)
-    */
+   /* TODO: handling low-delay / B-GOP weights for P/B frames. */
    double weight = is_intra ? 0.60 : 0.65;
-   double num = weight * hevc_vdenc_cmd1_qp_scale[cmd1_qp - 1];
+   double num = weight * hevc_vdenc_cmd1_qp_scale[frame_qp - 1];
    uint32_t par0 = MIN2(65535u, (uint32_t)(num * 4 + 0.5));
    uint32_t par1 = MIN2(65535u, (uint32_t)(sqrt(num) * 4 + 0.5));
 
-   uint8_t par[93] = { 0 };
-   memcpy(&par[8], hevc_vdenc_cmd1_par8_11_gen125[type],
-          sizeof(hevc_vdenc_cmd1_par8_11_gen125[0]));
-   memcpy(&par[12], hevc_vdenc_cmd1_par12_15_gen125[type],
-          sizeof(hevc_vdenc_cmd1_par12_15_gen125[0]));
-   memcpy(&par[16], hevc_vdenc_cmd1_par16_21_gen125[type],
-          sizeof(hevc_vdenc_cmd1_par16_21_gen125[0]));
-   par[22] = 4;
-   par[23] = hevc_vdenc_cmd1_par23_gen125[type];
-   par[30] = hevc_vdenc_cmd1_par30_gen125[type];
-   memcpy(&par[34], hevc_vdenc_cmd1_par34_35[type],
-          sizeof(hevc_vdenc_cmd1_par34_35[0]));
-   memcpy(&par[36], hevc_vdenc_cmd1_par36_41_gen125[type],
-          sizeof(hevc_vdenc_cmd1_par36_41_gen125[0]));
-   par[45] = 20;
-   memcpy(&par[47], hevc_vdenc_cmd1_par47_54_gen125[type],
-          sizeof(hevc_vdenc_cmd1_par47_54_gen125[0]));
-   memcpy(&par[55], hevc_vdenc_cmd1_par55_86_gen125,
-          sizeof(hevc_vdenc_cmd1_par55_86_gen125));
-   memcpy(&par[87], hevc_vdenc_cmd1_par87_89_gen125[type],
-          sizeof(hevc_vdenc_cmd1_par87_89_gen125[0]));
+   static const uint8_t par2[8]  = { 0, 2, 3, 5, 6, 8, 9, 11 };
+   static const uint8_t par3[12] = { 4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92 };
 
-#define CMD1_BYTES(b0, b1, b2, b3) \
-   ((uint32_t)(b0) | (uint32_t)(b1) << 8 | (uint32_t)(b2) << 16 | (uint32_t)(b3) << 24)
-
-#if GFX_VER >= 20
+   /* v[i] is dword i + 1 of the command, the layout follows media-driver's
+    * VDENC_CMD1 par -> dword mapping (mhw_vdbox_vdenc_impl.h).
+    */
    uint32_t v[GENX(VDENC_CMD1_length) - 1] = { 0 };
-#else
-   uint32_t v[32] = { 0 };
-#endif
-   v[0] = CMD1_BYTES(hevc_vdenc_cmd1_par2[0], hevc_vdenc_cmd1_par2[1],
-                     hevc_vdenc_cmd1_par2[2], hevc_vdenc_cmd1_par2[3]);
-   v[1] = CMD1_BYTES(hevc_vdenc_cmd1_par2[4], hevc_vdenc_cmd1_par2[5],
-                     hevc_vdenc_cmd1_par2[6], hevc_vdenc_cmd1_par2[7]);
-   for (unsigned i = 0; i < 3; i++) {
-      v[2 + i] = CMD1_BYTES(hevc_vdenc_cmd1_par3[4 * i], hevc_vdenc_cmd1_par3[4 * i + 1],
-                            hevc_vdenc_cmd1_par3[4 * i + 2], hevc_vdenc_cmd1_par3[4 * i + 3]);
-      v[5 + i] = CMD1_BYTES(hevc_vdenc_cmd1_par4_gen125[4 * i],
-                            hevc_vdenc_cmd1_par4_gen125[4 * i + 1],
-                            hevc_vdenc_cmd1_par4_gen125[4 * i + 2],
-                            hevc_vdenc_cmd1_par4_gen125[4 * i + 3]);
-   }
-   v[8] = CMD1_BYTES(par[5], par[6], par[7], 0);
-   v[9] = CMD1_BYTES(par[8], par[12], par[9], par[13]);
-   v[10] = CMD1_BYTES(par[10], par[14], par[11], par[15]);
-   for (unsigned i = 0; i < 7; i++)
-      v[11 + i] = CMD1_BYTES(par[16 + 4 * i], par[17 + 4 * i], par[18 + 4 * i], par[19 + 4 * i]);
-   v[18] = CMD1_BYTES(0, par[44], par[45], par[46]);
-   v[19] = CMD1_BYTES(par[47], par[48], par[49], par[50]);
-   v[20] = CMD1_BYTES(par[51], par[52], par[53], par[54]);
-   v[21] = par0 | par1 << 16;
    for (unsigned i = 0; i < 8; i++)
-      v[22 + i] = CMD1_BYTES(par[55 + 4 * i], par[56 + 4 * i], par[57 + 4 * i], par[58 + 4 * i]);
-   v[30] = CMD1_BYTES(par[87], par[88], par[89], 0);
-   v[31] = CMD1_BYTES(par[90], par[91], par[92], 0);
-#undef CMD1_BYTES
+      v[i / 4] |= (uint32_t)par2[i] << (8 * (i % 4));
+   for (unsigned i = 0; i < 12; i++) {
+      v[2 + i / 4] |= (uint32_t)par3[i] << (8 * (i % 4));
+      v[5 + i / 4] |= (uint32_t)par3[i] << (8 * (i % 4));
+   }
+   v[12] = 4u << 16;
+   v[15] = (uint32_t)(is_intra ? 21 : 7) << 16 | (uint32_t)(is_intra ? 0 : 4) << 24;
+   v[18] = 20u << 16;
+   v[19] = v[20] = 0x0c0c0c0c;
+   v[21] = par0 | par1 << 16;
+   for (unsigned i = 22; i <= 29; i++)
+      v[i] = 0x10101010;
+   v[30] = (uint32_t)(is_intra ? 16 : 20) |
+           (uint32_t)(is_intra ? 16 : 20) << 8 |
+           (uint32_t)(is_intra ? 47 : 20) << 16;
 
 #if GFX_VER >= 20
    /* Xe2 HPG (BMG) tuning on top of the common settings, from media-driver
@@ -2793,8 +2773,7 @@ anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
       cmd1.Values[5] = 0x1c140c04;
       cmd1.Values[6] = 0x3c342c24;
       cmd1.Values[7] = 0x5c544c44;
-      uint32_t vqi_qp = CLAMP(anv_h265_slice_qp(cmd, enc_info, 0), 10, 51);
-      cmd1.Values[13] = vqi_qp >= 22 ? hevc_vdenc_cmd1_vqi_dw14_gen12[vqi_qp - 22] : 0;
+      cmd1.Values[13] = 0x0;
       cmd1.Values[14] = 0x0;
       cmd1.Values[15] &= 0xffff0000;
 
@@ -2935,8 +2914,27 @@ anv_h265_emit_hcp_pic_state(struct anv_cmd_buffer *cmd,
       pic.RhoDomainRateControlEnable = true;
       pic.FractionalQPAdjustmentEnable = true;
       pic.RhoDomainFrameLevelQP = pps->init_qp_minus26 + 26;
+#if GFX_VER >= 20
+      pic.RDOQEnable = true;
+      pic.RDOQIntraTUThreshold = 0xffff;
+#endif
    }
 }
+
+/* VkVideoEncodeH265PictureInfoKHR::pStdPictureInfo->pRefLists is optional;
+ * Vulkan allows it to be NULL.  Use an empty list so the command stream code
+ * never dereferences a NULL pointer.
+ */
+static const StdVideoEncodeH265ReferenceListsInfo anv_h265_no_ref_lists = {
+   .RefPicList0 = {
+      [0 ... STD_VIDEO_H265_MAX_NUM_LIST_REF - 1] =
+         STD_VIDEO_H265_NO_REFERENCE_PICTURE,
+   },
+   .RefPicList1 = {
+      [0 ... STD_VIDEO_H265_MAX_NUM_LIST_REF - 1] =
+         STD_VIDEO_H265_NO_REFERENCE_PICTURE,
+   },
+};
 
 static void
 anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
@@ -2945,14 +2943,33 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
                          const uint8_t *dpb_idx,
                          bool is_low_delay)
 {
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const StdVideoH265PictureParameterSet *pps = anv_h265_pps(cmd, enc_info);
-   StdVideoEncodeH265ReferenceListsInfo* ref_lists =
-      (struct StdVideoEncodeH265ReferenceListsInfo *)frame_info->pStdPictureInfo->pRefLists;
-   uint32_t width_in_pix, height_in_pix;
-   anv_h265_frame_size(sps, &width_in_pix, &height_in_pix);
-   uint32_t frame_qp = anv_h265_slice_qp(cmd, enc_info, 0);
+   const struct VkVideoEncodeH265PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
+   struct vk_video_session_parameters *params = cmd->video.params;
+   const StdVideoH265SequenceParameterSet *sps =
+      vk_video_find_h265_enc_std_sps(params, frame_info->pStdPictureInfo->pps_seq_parameter_set_id);
+   const StdVideoH265PictureParameterSet *pps =
+      vk_video_find_h265_enc_std_pps(params, frame_info->pStdPictureInfo->pps_pic_parameter_set_id);
+   const StdVideoEncodeH265ReferenceListsInfo *ref_lists =
+      frame_info->pStdPictureInfo->pRefLists ?
+      frame_info->pStdPictureInfo->pRefLists : &anv_h265_no_ref_lists;
+   const bool is_10bit = (sps->bit_depth_luma_minus8 == 2) || (sps->bit_depth_chroma_minus8 == 2);
+   bool rc_disable = cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+   int32_t frame_qp = rc_disable ?
+      frame_info->pNaluSliceSegmentEntries[0].constantQp :
+      pps->init_qp_minus26 + 26;
+   frame_qp = CLAMP(frame_qp, 10, 51);
+   const bool is_i_frame =
+      anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0;
+   const bool is_p_frame =
+      frame_info->pStdPictureInfo->pic_type == STD_VIDEO_H265_PICTURE_TYPE_P;
+   StdVideoEncodeH265PictureInfo pic_info = *frame_info->pStdPictureInfo;
+   pic_info.flags.slice_temporal_mvp_enabled_flag &=
+      sps->flags.sps_temporal_mvp_enabled_flag;
+   uint32_t frame_width_in_min_cb = sps->pic_width_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t frame_height_in_min_cb = sps->pic_height_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t width_in_pix = frame_width_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t height_in_pix = frame_height_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
 
    if (!batch)
       batch = &cmd->batch;
@@ -2973,7 +2990,139 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
       uint8_t ref_idx[4] = { 0, 0x7, 0x7, 0 };
 #endif
 
-#if GFX_VERx10 >= 125
+#if GFX_VER >= 20
+      /* Xe2 HPG (BMG) values from media-driver's Xe2_HPM HEVC const
+       * settings (encode_hevc_vdenc_const_settings_xe2_hpm_open.h). Target
+       * usage is fixed to 4, IBC / palette / RDOQ are off, low delay mode
+       * (the sequence level hint) follows the frame's low delay state.
+       * Wa_22011549751 does not apply to BMG, intra frames are programmed
+       * as such.
+       *
+       * LUT index follows media-driver CodingType - 1 (I=0, P=1, B=2),
+       * even when P frames are later submitted as GPB.
+       *
+       * TODO: Target usage from the quality level;
+       * hierarchical GOP rounding offsets.
+       */
+      StdVideoH265PictureType std_pic_type = frame_info->pStdPictureInfo->pic_type;
+      uint32_t pic_type =
+         (std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_I ||
+          std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_IDR) ? 0 :
+         (std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_P) ? 1 : 2;
+      const uint32_t target_usage = 4;
+      uint32_t low_delay = is_low_delay;
+      uint32_t num_l0_is0 = pic_type == 0 ? 1 : (ref_lists->num_ref_idx_l0_active_minus1 == 0);
+      uint32_t chroma_format_idc = MIN2(sps->chroma_format_idc, 3);
+
+      cmd2.Values2  |= 0x3;
+      cmd2.Values5  |= xe2_hevc_vdenc_cmd2_dw5[pic_type];
+      cmd2.Values7  |= xe2_hevc_vdenc_cmd2_dw7[pic_type][num_l0_is0][low_delay];
+      cmd2.Values8  |= xe2_hevc_vdenc_cmd2_dw8[pic_type][target_usage][low_delay][0][low_delay];
+      cmd2.Values9  |= xe2_hevc_vdenc_cmd2_dw9[pic_type][target_usage][low_delay][0][low_delay];
+      cmd2.Values12 |= xe2_hevc_vdenc_cmd2_dw12[target_usage];
+      cmd2.Values19 |= 0x98000000;
+      cmd2.Values23 |= 0xcccc0000;
+      cmd2.Values28 |= 0x07d00fa0;
+      cmd2.Values29 |= 0x02bc0bb8;
+      cmd2.Values30 |= 0x032003e8;
+      cmd2.Values31 |= 0x01f4012c;
+      cmd2.Values32 |= 0x190;
+      cmd2.Values35 |= 0xecc;
+      /* From dword 38 on ValuesN is dword N - 1. */
+      cmd2.Values52 |= xe2_hevc_vdenc_cmd2_dw51[target_usage][0][0];
+      cmd2.Values53 |= xe2_hevc_vdenc_cmd2_dw52[target_usage];
+      cmd2.Values54 |= xe2_hevc_vdenc_cmd2_dw53[target_usage];
+      cmd2.Values55 |= xe2_hevc_vdenc_cmd2_dw54[target_usage][0][0][chroma_format_idc];
+
+      /* Rounding precision: intra 10, inter 4 for a non hierarchical GOP. */
+      const uint32_t round_intra = 10, round_inter = 4;
+      cmd2.Values32 |= round_inter << 16 | round_inter << 20 |
+                       round_intra << 24 | round_intra << 28;
+      cmd2.Values33 |= round_inter | round_inter << 4 |
+                       round_inter << 8 | round_inter << 12 |
+                       round_intra << 16 | round_intra << 20 |
+                       round_inter << 24 | round_inter << 28;
+      cmd2.Values34 |= round_inter | round_inter << 4 |
+                       round_intra << 8 | round_intra << 12 |
+                       round_inter << 16 | round_inter << 20;
+
+      int32_t poc_l0[3] = { 0, };
+      int32_t poc_l1[3] = { 0, };
+
+      if (pic_type != 0) {
+         for (unsigned i = 0;
+              i < ref_lists->num_ref_idx_l0_active_minus1 + 1 && i < l1_entry;
+              i++) {
+            uint8_t slot = ref_lists->RefPicList0[i];
+
+            if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE) {
+               ref_idx[i] = dpb_idx[slot];
+               if (i < 3) {
+                  bool lt = false;
+                  int32_t rp = 0;
+                  anv_h265_get_ref_poc(enc_info, slot, &rp, &lt);
+                  poc_l0[i] = rp;
+               }
+            }
+         }
+
+         /* VDEnc only takes a dedicated backward reference when the frame
+          * references the future. Low-delay (including P / GPB) leaves the
+          * L1 CMD2 slot at 0x7; BwdRef0 is still bound to FwdRef0.
+          */
+         if (!is_low_delay) {
+            uint8_t slot = ref_lists->RefPicList1[0];
+
+            if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE) {
+               ref_idx[l1_entry] = dpb_idx[slot];
+               bool lt = false;
+               int32_t rp = 0;
+               anv_h265_get_ref_poc(enc_info, slot, &rp, &lt);
+               poc_l1[0] = rp;
+            }
+         } else {
+            /* Low delay: the L1 slot carries the current POC. */
+            poc_l1[0] = pic_info.PicOrderCntVal;
+         }
+      }
+
+      {
+         const StdVideoEncodeH265SliceSegmentHeader *sh =
+            frame_info->pNaluSliceSegmentEntries[0].pStdSliceSegmentHeader;
+         uint32_t lt_l0 = 0, lt_l1 = 0;
+
+         cmd2.CollocatedFromL0Flag = sh->flags.collocated_from_l0_flag;
+
+         for (unsigned i = 0; i < 3 && i < ref_lists->num_ref_idx_l0_active_minus1 + 1; i++) {
+            uint8_t slot = ref_lists->RefPicList0[i];
+            bool lt = false;
+            if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE) {
+               int32_t rp = 0;
+               anv_h265_get_ref_poc(enc_info, slot, &rp, &lt);
+            }
+            if (lt)
+               lt_l0 |= 1u << i;
+         }
+         for (unsigned i = 0; i < 3 && i < ref_lists->num_ref_idx_l1_active_minus1 + 1; i++) {
+            uint8_t slot = ref_lists->RefPicList1[i];
+            bool lt = false;
+            if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE) {
+               int32_t rp = 0;
+               anv_h265_get_ref_poc(enc_info, slot, &rp, &lt);
+            }
+            if (lt)
+               lt_l1 |= 1u << i;
+         }
+         cmd2.LongTermReferenceFlagsL0 = lt_l0;
+         cmd2.LongTermReferenceFlagsL1 = lt_l1;
+      }
+      cmd2.POCNumberForRefid0InL0 = poc_l0[0];
+      cmd2.POCNumberForRefid0InL1 = poc_l1[0];
+      cmd2.POCNumberForRefid1InL0 = poc_l0[1];
+      cmd2.POCNumberForRefid1InL1 = poc_l1[1];
+      cmd2.POCNumberForRefid2InL0 = poc_l0[2];
+      cmd2.POCNumberForRefid2InL1 = poc_l1[2];
+#elif GFX_VERx10 >= 125
       /* Target usage is fixed to 4. The last two lookup indices are
        * pps_curr_pic_ref_enabled_flag, which is not supported here, and
        * Wa_22011549751, which is in effect and also decides the intra
@@ -2989,6 +3138,13 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
       uint32_t num_l0_is0 = pic_type == 0 ? 1 : (ref_lists->num_ref_idx_l0_active_minus1 == 0);
 
       cmd2.Values5  |= hevc_vdenc_cmd2_dw5[pic_type];
+      /* DW5: FwdRefIdx0[0:3], BwdRefIdx0[4:7], FwdRefIdx1[8:11],
+       * FwdRefIdx2[16:19].  ref_idx[] holds the DPB slot indices.
+       */
+      cmd2.Values5 |= (ref_idx[0] & 0xf) |
+                      ((ref_idx[l1_entry] & 0xf) << 4) |
+                      ((ref_idx[1] & 0xf) << 8) |
+                      ((ref_idx[2] & 0xf) << 16);
       cmd2.Values7  |= hevc_vdenc_cmd2_dw7[pic_type][num_l0_is0][low_delay][0][1];
       cmd2.Values9  |= hevc_vdenc_cmd2_dw9[pic_type][target_usage][low_delay][0][1];
       cmd2.Values12 |= hevc_vdenc_cmd2_dw12[target_usage];
@@ -2996,39 +3152,8 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
       cmd2.Values23 |= 0xcccc0000;
       cmd2.Values53 |= hevc_vdenc_cmd2_dw52[target_usage];
       cmd2.Values55 |= hevc_vdenc_cmd2_dw54[target_usage][0];
-      cmd2.Values52 |= hevc_vdenc_cmd2_dw51_gen125[pic_type][target_usage];
-      cmd2.Values54 |= hevc_vdenc_cmd2_dw53_gen125[pic_type][target_usage];
-
-      /* TODO: palette, current picture reference, and RDOQ are not handled. */
-      cmd2.Values2 |= 0x3;
-      cmd2.Values8 |= hevc_vdenc_cmd2_dw8_gen125[pic_type][target_usage][low_delay];
-      cmd2.SubPelMode = 3;
-      cmd2.MinQp = 10;
-      cmd2.Values28 |= 0x07d00fa0;
-      cmd2.Values29 |= 0x02bc0bb8;
-      cmd2.Values30 |= 0x032003e8;
-      cmd2.Values31 |= 0x01f4012c;
-      cmd2.Values32 |= 0x190;
-      cmd2.Values35 |= 0xecc;
-
-      /* TODO Hierarchy-dependent rounding offsets. */
-      uint32_t round_intra = 10;
-      uint32_t round_inter = 4;
-      cmd2.Values32 |= round_inter << 16 | round_inter << 20 |
-                       round_intra << 24 | round_intra << 28;
-      cmd2.Values33 |= round_inter | round_inter << 4 | round_inter << 8 |
-                       round_inter << 12 | round_intra << 16 | round_intra << 20 |
-                       round_inter << 24 | round_inter << 28;
-      cmd2.Values34 |= round_inter | round_inter << 4 | round_intra << 8 |
-                       round_intra << 12 | round_inter << 16 | round_inter << 20;
-      cmd2.AV1L0RefID0 = 1;
-      cmd2.AV1L0RefID1 = 1;
-      cmd2.AV1L0RefID2 = 1;
-      cmd2.AV1L0RefID3 = 1;
-      cmd2.AV1L1RefID0 = 1;
-      cmd2.AV1L1RefID1 = 1;
-      cmd2.AV1L1RefID2 = 1;
-      cmd2.AV1L1RefID3 = 1;
+      cmd2.Values52 |= pic_type == 0 ? 0x20003552 : 0x22223552;
+      cmd2.Values54 |= pic_type == 0 ? 0x80000000 : 0xff000000;
 
       if (pic_type == 0) {
          /* Wa_22011549751 also forces intra frames to low delay B with both
@@ -3047,8 +3172,9 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
                ref_idx[i] = dpb_idx[slot];
          }
 
-         /* VDEnc only takes a backward reference when the frame references
-          * the future.
+         /* VDEnc only takes a dedicated backward reference when the frame
+          * references the future. Low-delay (including P / GPB) leaves the
+          * L1 CMD2 slot at 0x7; BwdRef0 is still bound to FwdRef0.
           */
          if (!is_low_delay) {
             uint8_t slot = ref_lists->RefPicList1[0];
@@ -3058,47 +3184,21 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
          }
       }
 #else
-      uint32_t pic_type = anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type);
-      /* TODO: target usage is fixed to 4 ("Normal mode"). */
-      uint32_t target_usage = 4;
-
-      /* TODO Hierarchy-dependent rounding offsets. */
-      uint32_t round_intra = 10;
-      uint32_t round_inter = 4;
-
-      cmd2.Values2  = hevc_vdenc_cmd2_dw2_gen12[pic_type][target_usage];
-      cmd2.Values5  = (cmd2.Values5 & 0xff7e03ff) | 0x80ac00;
       cmd2.Values5  = (cmd2.Values5 & 0xff83ffff) | 0x400000;
-      if (frame_qp >= 22 && frame_qp <= 51)
-         cmd2.Values6 = (cmd2.Values6 & 0xc00fffff) | 0x1fb00000;
-      cmd2.Values7  = hevc_vdenc_cmd2_dw7_gen12[pic_type][target_usage];
-      cmd2.Values9  = hevc_vdenc_cmd2_dw9_gen12[target_usage];
-      cmd2.Values12 = hevc_vdenc_cmd2_dw12_gen12[target_usage];
+      cmd2.Values9  = (cmd2.Values9 & 0xffff) | 0x43840000;
+      cmd2.Values12 = 0xffffffff;
       cmd2.Values14 = (cmd2.Values14 & 0xffff) | 0x7d00000;
       cmd2.Values15 = 0x4e201f40;
       cmd2.Values17 = (cmd2.Values17 & 0xfff00000) | 0x2710;
       cmd2.Values18 = (cmd2.Values18 & 0xffff) | 0x600000;
-      cmd2.Values19 = (cmd2.Values19 & 0x80ff0000) | 0x180000c0;
+      cmd2.Values19 = (cmd2.Values19 & 0x80ffffff) | 0x18000000;
       cmd2.Values20 &= 0xfffeffff;
       cmd2.Values21 &= 0xfffffff;
       cmd2.Values22 = 0x1f001102;
       cmd2.Values23 = 0xaaaa1f00;
 
-      cmd2.Values28 = 0x7d00fa0;
-      cmd2.Values29 = 0x2bc0bb8;
-      cmd2.Values30 = 0x32003e8;
-      cmd2.Values31 = 0x1f4012c;
-      cmd2.Values32 = hevc_vdenc_cmd2_rounding_dw32_gen12[round_inter - 2][round_intra - 8] | 0x190;
-      cmd2.Values33 = hevc_vdenc_cmd2_rounding_dw33_gen12[round_inter - 2][round_intra - 8];
-      cmd2.Values34 = hevc_vdenc_cmd2_rounding_dw34_gen12[round_inter - 2][round_intra - 8] |
-                      hevc_vdenc_cmd2_dw34_gen12[target_usage];
-      cmd2.Values35 = (cmd2.Values35 & 0xfffff0ff) | 0x700;
-      cmd2.MinQp = 10;
-
-      bool is_inter = pic_type != 0;
-
-      if (!is_inter)
-         cmd2.Values7 |= 0x80000;
+      bool is_inter =
+         anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) != 0;
 
       if (is_inter) {
          if (ref_lists->num_ref_idx_l0_active_minus1 == 0)
@@ -3122,14 +3222,16 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
                          0 : dpb_idx[slot];
          }
 
-         /* VDEnc only takes a backward reference when the frame references
-          * the future.
+         /* VDEnc only takes a dedicated backward reference when the frame
+          * references the future. Low-delay reuses the unused L1 slot.
           */
          if (!is_low_delay) {
             uint8_t slot = ref_lists->RefPicList1[0];
 
             if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE)
                ref_idx[l1_entry] = dpb_idx[slot];
+         } else {
+            ref_idx[l1_entry] = ref_idx[0];
          }
       }
 #endif
@@ -3137,139 +3239,118 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
       for (unsigned i = 0; i < ARRAY_SIZE(ref_idx); i++)
          cmd2.Values11 |= (uint32_t)ref_idx[i] << (8 * i);
 
-      cmd2.Values11 |= 1u << 31;
-
-      cmd2.Values16 = (cmd2.Values16 & 0xf0ff0000) | 0xf003300;
+      /* media-driver clamps MinQp to 10 and MaxQp to 51 for VDEnc. */
+      cmd2.Values16 = (cmd2.Values16 & 0xf0ff0000) | 0xf00330a;
+      cmd2.SubPelMode = 3;
       cmd2.QpPrimeYAc = frame_qp;
 
-      cmd2.FrameWidthInPixelsMinusOne = width_in_pix - 1;
-      cmd2.FrameHeightInPixelsMinusOne = height_in_pix - 1;
-#if GFX_VERx10 >= 125
+      cmd2.FrameWidthInPixelsMinusOne = align(width_in_pix, 8) - 1;
+      cmd2.FrameHeightInPixelsMinusOne = align(height_in_pix, 8) - 1;
+#if GFX_VERx10 == 125
       /* Wa_22011549751: intra frames are programmed as low delay B. */
       cmd2.PictureType = is_low_delay ? 3 : 2;
 #else
       cmd2.PictureType = anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0 ?
                          0 : (is_low_delay ? 3 : 2);
 #endif
-      cmd2.TemporalMVPEnableFlag =
-            anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0 ?
-            0 : sps->flags.sps_temporal_mvp_enabled_flag;
+      cmd2.TemporalMVPEnableFlag = (is_i_frame || is_p_frame) ? 0 :
+         pic_info.flags.slice_temporal_mvp_enabled_flag;
 #if GFX_VERx10 >= 125
-      cmd2.TransformSkip = false;
-#else
-      cmd2.TransformSkip = pps->flags.transform_skip_enabled_flag;
+      /* GPB / P has no dedicated L1; force collocated-from-L0 so VDEnc does
+       * not walk the unused 0x7 L1 CMD2 slot.
+       */
+      cmd2.CollocatedFromL0Flag = is_p_frame || is_low_delay;
 #endif
+      cmd2.TransformSkip = pps->flags.transform_skip_enabled_flag;
       cmd2.TilingEnable = pps->flags.tiles_enabled_flag;
 
-      if (anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) != 0) {
-         /* Handle GPB(Generalized P and B frames) */
-         if (frame_info->pStdPictureInfo->pic_type == STD_VIDEO_H265_PICTURE_TYPE_P) {
-            ref_lists->num_ref_idx_l1_active_minus1 = ref_lists->num_ref_idx_l0_active_minus1;
-            for (int i = 0; i< STD_VIDEO_H265_MAX_NUM_LIST_REF; i++) {
-               ref_lists->RefPicList1[i] = ref_lists->RefPicList0[i];
-               ref_lists->list_entry_l1[i] = ref_lists->list_entry_l0[i];
-            }
+      if (!is_i_frame) {
+         /* VDENC picture type 3 (GPB) for P / low-delay, but HCP keeps the
+          * original P slice and L0-only REF_IDX (media-driver encodeHevcPSlice).
+          */
+         if (ref_lists) {
+            cmd2.NumRefIdxL0MinusOne = ref_lists->num_ref_idx_l0_active_minus1;
+            cmd2.NumRefIdxL1MinusOne = is_p_frame ? 0 :
+                                       ref_lists->num_ref_idx_l1_active_minus1;
          }
 
-         cmd2.NumRefIdxL0MinusOne = ref_lists->num_ref_idx_l0_active_minus1;
-         cmd2.NumRefIdxL1MinusOne = ref_lists->num_ref_idx_l1_active_minus1;
+         /* Match HevcBasicFeature: current POC minus reference POC, with
+          * independent long-term flags for each L0 entry. Keep full POCs
+          * until clamping; POC 255 is a valid reference, not a sentinel.
+          */
+         int32_t poc_l0[3] = { 0, };
+         for (unsigned i = 0; i <= ref_lists->num_ref_idx_l0_active_minus1 && i < 3; i++) {
+            bool long_term;
+            int32_t ref_poc = 0;
+            anv_h265_get_ref_poc(enc_info, ref_lists->RefPicList0[i], &ref_poc, &long_term);
+            int64_t diff_poc = (int64_t)pic_info.PicOrderCntVal - ref_poc;
+            poc_l0[i] = CLAMP(diff_poc, -16, 16);
+            cmd2.LongTermReferenceFlagsL0 |= (uint32_t)long_term << i;
+         }
+         cmd2.POCNumberForRefid0InL0 = poc_l0[0];
+         cmd2.POCNumberForRefid1InL0 = poc_l0[1];
+         cmd2.POCNumberForRefid2InL0 = poc_l0[2];
 
-#if GFX_VERx10 >= 125
-         uint32_t num_ref_l0 = ref_lists->num_ref_idx_l0_active_minus1 + 1;
-         uint32_t num_ref_l1 = ref_lists->num_ref_idx_l1_active_minus1 + 1;
-
-         if (num_ref_l0 < 5 && num_ref_l1 < 4)
-            cmd2.Values57 |= hevc_vdenc_cmd2_dw56_gen125[pic_type][num_ref_l0][num_ref_l1];
-#endif
-
-         bool long_term = false;
-         uint8_t ref_slot = ref_lists->RefPicList0[0];
-         int32_t cur_poc = frame_info->pStdPictureInfo->PicOrderCntVal;
-         int32_t ref_poc;
-         bool found = anv_h265_get_ref_poc(enc_info, ref_slot, &ref_poc, &long_term);
-         int8_t diff_poc = cur_poc - ref_poc;
-
-         cmd2.POCNumberForRefid0InL0 = CLAMP(diff_poc, -16, 16);
-         cmd2.LongTermReferenceFlagsL0 |= long_term;
-
-         ref_slot = ref_lists->RefPicList0[1];
-         found = anv_h265_get_ref_poc(enc_info, ref_slot, &ref_poc, &long_term);
-         diff_poc = cur_poc - (found ? ref_poc : 0);
-
-         cmd2.POCNumberForRefid1InL0 = CLAMP(diff_poc, -16, 16);
-         cmd2.LongTermReferenceFlagsL0 |= long_term << 1;
-
-         ref_slot = ref_lists->RefPicList0[2];
-         found = anv_h265_get_ref_poc(enc_info, ref_slot, &ref_poc, &long_term);
-         diff_poc = cur_poc - (found ? ref_poc : 0);
-
-         cmd2.POCNumberForRefid2InL0 = CLAMP(diff_poc, -16, 16);
-         cmd2.LongTermReferenceFlagsL0 |= long_term << 2;
-
-
-         ref_slot = ref_lists->RefPicList1[0];
-         found = anv_h265_get_ref_poc(enc_info, ref_slot, &ref_poc, &long_term);
-         diff_poc = found ? cur_poc - ref_poc : 0;
-
+         bool long_term;
+         uint8_t ref_slot = is_p_frame ? ref_lists->RefPicList0[0] :
+                                        ref_lists->RefPicList1[0];
+         int32_t ref_poc = 0;
+         anv_h265_get_ref_poc(enc_info, ref_slot, &ref_poc, &long_term);
+         int64_t diff_poc = (int64_t)pic_info.PicOrderCntVal - ref_poc;
          cmd2.POCNumberForRefid0InL1 = CLAMP(diff_poc, -16, 16);
-         cmd2.LongTermReferenceFlagsL1 |= long_term;
+         cmd2.LongTermReferenceFlagsL1 = long_term;
 
          cmd2.POCNumberForRefid1InL1 = cmd2.POCNumberForRefid1InL0;
          cmd2.POCNumberForRefid2InL1 = cmd2.POCNumberForRefid2InL0;
-#if GFX_VERx10 >= 125
-         cmd2.POCNumberForRefid3InL0 = 4;
-         cmd2.POCNumberForRefid3InL1 = -4;
-#else
-         cmd2.Values4 |= 0xfc040000;
-#endif
          cmd2.SubPelMode = 3;
       }
 
 #if GFX_VERx10 < 125
       int tbl_idx = anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type);
       cmd2.Values26 = hevc_sad_qp_lambda_tbl[tbl_idx][CLAMP(frame_qp, 10, 51) - 10];
-      if (tbl_idx == 0 && frame_qp >= 22 && frame_qp <= 51)
-         cmd2.Values26 = (cmd2.Values26 & 0xfe00ffff) |
-                         (uint32_t)hevc_vdenc_cmd2_vqi_sad_lambda_i_gen12[frame_qp - 22] << 16;
 #endif
 
-#if GFX_VER >= 20
-      /* Xe2 HPG (BMG) values from media-driver's Xe2_HPM HEVC const settings.
-       * Target usage is fixed to 4, IBC / palette / RDOQ off, low delay mode
-       * follows the frame's low delay state.  Wa_22011549751 does not apply
-       * to BMG.
+      /* VK_KHR_video_encode_intra_refresh: rolling intra refresh.  The app
+       * gives a cycle duration (how many pictures a full refresh takes) and the
+       * index of this picture in the cycle; the hardware refreshes one band of
+       * 32 luma samples per picture, moving row or column by row.
        */
-      {
-         StdVideoH265PictureType std_pic_type = frame_info->pStdPictureInfo->pic_type;
-         uint32_t pic_type =
-            (std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_I ||
-             std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_IDR) ? 0 :
-            (std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_P) ? 1 : 2;
-         const uint32_t target_usage = 4;
-         uint32_t low_delay = is_low_delay;
-         uint32_t num_l0_is0 = pic_type == 0 ? 1 : (ref_lists->num_ref_idx_l0_active_minus1 == 0);
-         uint32_t chroma_format_idc = MIN2(sps->chroma_format_idc, 3);
+      const VkVideoEncodeIntraRefreshInfoKHR *intra_refresh =
+         (enc_info->flags & VK_VIDEO_ENCODE_INTRA_REFRESH_BIT_KHR) ?
+         vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_INTRA_REFRESH_INFO_KHR) :
+         NULL;
+      const bool rolling_intra_refresh =
+         cmd->video.vid->intra_refresh_mode ==
+            VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_BLOCK_ROW_BASED_BIT_KHR ||
+         cmd->video.vid->intra_refresh_mode ==
+            VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_BLOCK_COLUMN_BASED_BIT_KHR;
+      if (rolling_intra_refresh &&
+          intra_refresh != NULL &&
+          intra_refresh->intraRefreshCycleDuration > 0 &&
+          !is_i_frame) {
+         const bool column_mode =
+            cmd->video.vid->intra_refresh_mode ==
+            VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_BLOCK_COLUMN_BASED_BIT_KHR;
+         const uint32_t limit =
+            DIV_ROUND_UP(column_mode ? width_in_pix : height_in_pix, 32);
+         uint32_t band = DIV_ROUND_UP(limit, intra_refresh->intraRefreshCycleDuration);
+         uint32_t pos = intra_refresh->intraRefreshIndex * band;
 
-         cmd2.Values2  |= 0x3;
-         cmd2.Values5  |= xe2_hevc_vdenc_cmd2_dw5[pic_type];
-         cmd2.Values7  |= xe2_hevc_vdenc_cmd2_dw7[pic_type][num_l0_is0][low_delay];
-         cmd2.Values8  |= xe2_hevc_vdenc_cmd2_dw8[pic_type][target_usage][low_delay][0][low_delay];
-         cmd2.Values9  |= xe2_hevc_vdenc_cmd2_dw9[pic_type][target_usage][low_delay][0][low_delay];
-         cmd2.Values12 |= xe2_hevc_vdenc_cmd2_dw12[target_usage];
-         cmd2.Values19 |= 0x98000000;
-         cmd2.Values23 |= 0xcccc0000;
-         cmd2.Values28 |= 0x07d00fa0;
-         cmd2.Values29 |= 0x02bc0bb8;
-         cmd2.Values30 |= 0x032003e8;
-         cmd2.Values31 |= 0x01f4012c;
-         cmd2.Values32 |= 0x190;
-         cmd2.Values35 |= 0xecc;
-         cmd2.Values52 |= xe2_hevc_vdenc_cmd2_dw51[target_usage][0][0];
-         cmd2.Values53 |= xe2_hevc_vdenc_cmd2_dw52[target_usage];
-         cmd2.Values54 |= xe2_hevc_vdenc_cmd2_dw53[target_usage];
-         cmd2.Values55 |= xe2_hevc_vdenc_cmd2_dw54[target_usage][0][0][chroma_format_idc];
+         if (band == 0)
+            band = 1;
+         if (band > limit)
+            band = limit;
+         if (pos + band > limit)
+            pos = limit > band ? limit - band : 0;
+
+         cmd2.IntraRefreshEnable = true;
+         cmd2.IntraRefreshMode = column_mode;
+         cmd2.IntraRefreshMBSizeMinusOne = band - 1;
+         cmd2.IntraRefreshPos = pos;
+         cmd2.IntraRefreshBoundaryRef0 = pos;
+         cmd2.IntraRefreshBoundaryRef1 = pos;
+         cmd2.IntraRefreshBoundaryRef2 = pos;
       }
-#endif
    }
 }
 
@@ -3492,7 +3573,21 @@ anv_h265_emit_hcp_slice_state(struct anv_cmd_buffer *cmd,
       slice.RoundInter = 4;
       slice.RoundIntra = 10;
 
-      slice.SliceHeaderLength = 0;
+      {
+         /* HCP_SLICE_STATE.SliceHeaderLength holds the slice header bit
+          * length up to the byte alignment (media-driver's
+          * BitLengthSliceHeaderStartingPortion), which the PAK needs in order
+          * to place the header before the slice data. */
+         uint8_t sh_data[256] = { 0, };
+         size_t sh_len = 0;
+         const int8_t sh_qp_delta = (int8_t)(slice_qp - (pps->init_qp_minus26 + 26));
+
+         vk_video_encode_h265_slice_header(frame_info->pStdPictureInfo,
+                                           anv_h265_vps(cmd, enc_info),
+                                           sps, pps, slice_header, sh_qp_delta,
+                                           &sh_len, &sh_data);
+         slice.SliceHeaderLength = sh_len ? (uint32_t)(sh_len - 1) * 8 : 0;
+      }
       slice.CABACZeroWordInsertionEnable = false;
       slice.EmulationByteSliceInsertEnable = true;
       slice.TailInsertionPresent = false;
