@@ -1563,6 +1563,7 @@
     <field name="SSE Enable" dword="19" bits="24:24" type="bool" />
     <field name="RDOQ Enable" dword="19" bits="25:25" type="bool" />
     <field name="Number of LCUs InNormal Slice Size Conformance Mode" dword="19" bits="27:26" type="uint" />
+    <field name="Temporal MV Pred Disable" dword="19" bits="31:31" type="bool" />
     <field name="Intra TU Count Based RDOQ Disable" dword="20" bits="6:6" type="bool" />
     <field name="Slice Size Threshold" dword="21" bits="31:0" type="uint" />
     <field name="Target Slice Size" dword="22" bits="31:0" type="uint" />
@@ -2094,6 +2095,8 @@
     <field name="Number of Vertical Requests for Source" dword="3" bits="19:16" type="uint" />
     <field name="Number of Horizontal Request for Source" dword="3" bits="23:20" type="uint" />
     <field name="Prefetch Offset for Source" dword="3" bits="27:24" type="uint" default="4" />
+    <field name="Capture Mode" dword="5" bits="12:11" type="uint" />
+    <field name="VDENC Pipe Mode Select Par0" dword="5" bits="17:17" type="bool" />
   </instruction>
   <instruction name="VDENC_WALKER_STATE" bias="2" length="27" engine="video">
     <field name="DWord Length" dword="0" bits="11:0" type="uint" default="25" />

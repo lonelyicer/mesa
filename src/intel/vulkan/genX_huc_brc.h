@@ -1216,7 +1216,8 @@ anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
 static void
 anv_h265_emit_hcp_pic_state(struct anv_cmd_buffer *cmd,
                             struct anv_batch *batch,
-                            const VkVideoEncodeInfoKHR *enc_info);
+                            const VkVideoEncodeInfoKHR *enc_info,
+                            bool not_first_pass);
 static void
 anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
                          struct anv_batch *batch,
@@ -1577,7 +1578,7 @@ anv_h265_brc_build_input_slb(struct anv_cmd_buffer *cmd,
    anv_h265_emit_vdenc_cmd1(cmd, &slb, enc_info);
    assert((uint32_t)(slb.next - slb.start) == ANV_H265_BRC_SLB_PIC_STATE_OFFSET);
 
-   anv_h265_emit_hcp_pic_state(cmd, &slb, enc_info);
+   anv_h265_emit_hcp_pic_state(cmd, &slb, enc_info, true);
    assert((uint32_t)(slb.next - slb.start) == ANV_H265_BRC_SLB_CMD2_OFFSET);
 
    anv_h265_emit_vdenc_cmd2(cmd, &slb, enc_info, dpb_idx, is_low_delay);

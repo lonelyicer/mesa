@@ -7361,6 +7361,13 @@ anv_image_dmv_top_address(const struct anv_image_view *iv,
                                     ((uint64_t)iv->vk.base_array_layer + arrayLayer));
 }
 
+static inline bool
+anv_image_has_vdenc_ds(const struct anv_image *image)
+{
+   return image->vid_ds_8x_surface.size > 0 &&
+          image->vid_ds_4x_surface.size > 0;
+}
+
 static inline struct anv_address MUST_CHECK
 anv_image_ds_8x_address(const struct anv_image_view *iv,
                         uint32_t arrayLayer)

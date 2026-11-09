@@ -2486,6 +2486,15 @@ anv_h265_emit_vdenc_pipe_mode_select(struct anv_cmd_buffer *cmd,
    const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
    const bool is_10bit = anv_h265_is_10bit(sps);
 
+   /* Xe2 HEVC P frames walk the 4x/8x downscaled references even when HME
+    * prefetch is off, so the surfaces must be written on I frames and
+    * prefetched on P frames.
+    */
+   uint32_t base_ref_array_layer;
+   const struct anv_image_view *base_ref_iv =
+      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
+   const bool has_ds = anv_image_has_vdenc_ds(base_ref_iv->image);
+
    anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_MODE_SELECT), vdenc_pipe_mode) {
       vdenc_pipe_mode.StandardSelect = SS_HEVC;
       vdenc_pipe_mode.FrameStatisticsStreamOutEnable = brc_enabled;
@@ -2494,17 +2503,21 @@ anv_h265_emit_vdenc_pipe_mode_select(struct anv_cmd_buffer *cmd,
       vdenc_pipe_mode.PAKChromaSubSamplingType = _420;
       vdenc_pipe_mode.OutputRangeControlAfterColorSpaceConversion = true;
       vdenc_pipe_mode.IsRandomAccess = !is_low_delay;
-      vdenc_pipe_mode.HMERegionPrefetchEnable = !vdenc_pipe_mode.TLBPrefetchEnable;
-      vdenc_pipe_mode.TopPrefetchEnableMode = 1;
+      vdenc_pipe_mode.DownScaled8xWriteDisable = !has_ds;
+      vdenc_pipe_mode.DownScaled4xWriteDisable = !has_ds;
+      vdenc_pipe_mode.HMERegionPrefetchEnable = has_ds;
+      vdenc_pipe_mode.TopPrefetchEnableMode = 0;
       vdenc_pipe_mode.LeftPrefetchAtWrapAround = true;
+      vdenc_pipe_mode.VerticalShift32Minus1 = 2;
       vdenc_pipe_mode.HzShift32Minus1 = 3;
-      vdenc_pipe_mode.NumberofVerticalRequests = 11;
+      vdenc_pipe_mode.NumberofVerticalRequests = 6;
       vdenc_pipe_mode.NumberofHorizontalRequests = 2;
 
       vdenc_pipe_mode.SourceLumaPackedDataTLBPrefetchEnable = true;
       vdenc_pipe_mode.SourceChromaTLBPrefetchEnable = true;
       vdenc_pipe_mode.HzShift32Minus1Src = 3;
       vdenc_pipe_mode.PrefetchOffsetforSource = 4;
+      vdenc_pipe_mode.VDENCPipeModeSelectPar0 = true;
    }
 }
 
@@ -2820,18 +2833,29 @@ anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
 static void
 anv_h265_emit_hcp_pic_state(struct anv_cmd_buffer *cmd,
                             struct anv_batch *batch,
-                            const VkVideoEncodeInfoKHR *enc_info)
+                            const VkVideoEncodeInfoKHR *enc_info,
+                            bool not_first_pass)
 {
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const StdVideoH265PictureParameterSet *pps = anv_h265_pps(cmd, enc_info);
-   uint32_t frame_width_in_min_cb =
-      sps->pic_width_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
-   uint32_t frame_height_in_min_cb =
-      sps->pic_height_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   const struct VkVideoEncodeH265PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
+   struct vk_video_session_parameters *params = cmd->video.params;
+   const StdVideoH265SequenceParameterSet *sps =
+      vk_video_find_h265_enc_std_sps(params, frame_info->pStdPictureInfo->pps_seq_parameter_set_id);
+   const StdVideoH265PictureParameterSet *pps =
+      vk_video_find_h265_enc_std_pps(params, frame_info->pStdPictureInfo->pps_pic_parameter_set_id);
+   bool rc_disable = cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+   int32_t frame_qp = rc_disable ?
+      frame_info->pNaluSliceSegmentEntries[0].constantQp :
+      pps->init_qp_minus26 + 26;
+   frame_qp = CLAMP(frame_qp, 10, 51);
 
    if (!batch)
       batch = &cmd->batch;
+
+   uint32_t frame_width_in_min_cb = sps->pic_width_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t frame_height_in_min_cb = sps->pic_height_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t width_in_pix = frame_width_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t height_in_pix = frame_height_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
 
    anv_batch_emit(batch, GENX(HCP_PIC_STATE), pic) {
       pic.FrameWidthInMinimumCodingBlockSize = frame_width_in_min_cb - 1;
@@ -2840,22 +2864,22 @@ anv_h265_emit_hcp_pic_state(struct anv_cmd_buffer *cmd,
       pic.PAKTransformSkipEnable = pps->flags.transform_skip_enabled_flag;
 
       pic.MinCUSize = sps->log2_min_luma_coding_block_size_minus3;
-      pic.LCUSize = sps->log2_diff_max_min_luma_coding_block_size +
-                    sps->log2_min_luma_coding_block_size_minus3;
+      pic.LCUSize = sps->log2_diff_max_min_luma_coding_block_size + sps->log2_min_luma_coding_block_size_minus3;
 
       pic.MinTUSize = sps->log2_min_luma_transform_block_size_minus2;
-      pic.MaxTUSize = sps->log2_diff_max_min_luma_transform_block_size +
-                      sps->log2_min_luma_transform_block_size_minus2;
+      pic.MaxTUSize = sps->log2_diff_max_min_luma_transform_block_size + sps->log2_min_luma_transform_block_size_minus2;
 
       pic.MinPCMSize = 0;
       pic.MaxPCMSize = 0;
+
+      /* media-driver sets NonFirstPass for the second VDEnc BRC pass. */
+      pic.NonFirstPass = not_first_pass;
 
       pic.ChromaSubsampling = sps->chroma_format_idc;
 
       const StdVideoEncodeH265SliceSegmentHeader *slice_header = NULL;
       for (uint32_t slice_id = 0; slice_id < frame_info->naluSliceSegmentEntryCount; slice_id++) {
-         const VkVideoEncodeH265NaluSliceSegmentInfoKHR *nalu =
-            &frame_info->pNaluSliceSegmentEntries[slice_id];
+         const VkVideoEncodeH265NaluSliceSegmentInfoKHR *nalu = &frame_info->pNaluSliceSegmentEntries[slice_id];
          if (nalu) {
             slice_header = nalu->pStdSliceSegmentHeader;
             break;
@@ -2865,13 +2889,14 @@ anv_h265_emit_hcp_pic_state(struct anv_cmd_buffer *cmd,
       pic.CollocatedPictureIsISlice = false;
       pic.CurrentPictureIsISlice = false;
 
-      pic.SampleAdaptiveOffsetEnable =
-         sps->flags.sample_adaptive_offset_enabled_flag ?
-            slice_header->flags.slice_sao_chroma_flag ||
-            slice_header->flags.slice_sao_luma_flag : 0;
+      pic.SampleAdaptiveOffsetEnable = sps->flags.sample_adaptive_offset_enabled_flag ? slice_header->flags.slice_sao_chroma_flag ||
+         slice_header->flags.slice_sao_luma_flag : 0;
       pic.PCMEnable = sps->flags.pcm_enabled_flag;
+      /* media-driver: in VDENC mode this field should always be 1.
+       * Max_DQP_Level 0 or 3 only (Xe2 HCP_PIC_STATE).
+       */
       pic.CUQPDeltaEnable = pps->flags.cu_qp_delta_enabled_flag;
-      pic.MaxDQPDepth = pps->flags.cu_qp_delta_enabled_flag ? pps->diff_cu_qp_delta_depth : 0;
+      pic.MaxDQPDepth = pps->diff_cu_qp_delta_depth;
       pic.PCMLoopFilterDisable = sps->flags.pcm_loop_filter_disabled_flag;
       pic.ConstrainedIntraPrediction = pps->flags.constrained_intra_pred_flag;
       pic.TilingEnable = pps->flags.tiles_enabled_flag;
@@ -2910,15 +2935,19 @@ anv_h265_emit_hcp_pic_state(struct anv_cmd_buffer *cmd,
       pic.CrQPOffsetList5 = pps->cr_qp_offset_list[5];
       pic.FirstSliceSegmentInPic = true;
       pic.SSEEnable = true;
+      pic.TemporalMVPredDisable = !sps->flags.sps_temporal_mvp_enabled_flag;
+      /* media-driver enables RDOQ in HCP_PIC_STATE as well and leaves the
+       * intra TU threshold at its maximum (observed SLB DW19 bit 25 and
+       * DW37 = 0xffff).
+       */
+      pic.RDOQEnable = true;
+      pic.RDOQIntraTUThreshold = 0xffff;
       /* for VDENC mode */
       pic.RhoDomainRateControlEnable = true;
       pic.FractionalQPAdjustmentEnable = true;
-      pic.RhoDomainFrameLevelQP = pps->init_qp_minus26 + 26;
-#if GFX_VER >= 20
-      pic.RDOQEnable = true;
-      pic.RDOQIntraTUThreshold = 0xffff;
-#endif
+      pic.RhoDomainFrameLevelQP = frame_qp;
    }
+
 }
 
 /* VkVideoEncodeH265PictureInfoKHR::pStdPictureInfo->pRefLists is optional;
@@ -4041,7 +4070,7 @@ anv_h265_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
          }
       } else {
          anv_h265_emit_vdenc_cmd1(cmd, NULL, enc_info);
-         anv_h265_emit_hcp_pic_state(cmd, NULL, enc_info);
+         anv_h265_emit_hcp_pic_state(cmd, NULL, enc_info, false);
          anv_h265_emit_vdenc_cmd2(cmd, NULL, enc_info, dpb_idx, is_low_delay);
 #if GFX_VER >= 20
          /* Xe2 VDEnc expects the RDOQ lambda table command to be programmed. */
