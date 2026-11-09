@@ -329,7 +329,11 @@ video_profile_supported(struct anv_physical_device *pdevice,
 static bool
 anv_video_encode_brc_supported(const struct anv_physical_device *pdevice)
 {
-   return pdevice->info.ver >= 12 && pdevice->has_huc;
+   /* The HuC BRC path is not wired up for the Xe2 VDEnc command set yet, so
+    * only advertise rate control where the encoder is actually programmed.
+    */
+   return pdevice->info.ver >= 12 && pdevice->has_huc &&
+          pdevice->info.platform != INTEL_PLATFORM_BMG;
 }
 
 VkResult
