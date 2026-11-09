@@ -1614,39 +1614,6 @@ anv_queue_submit(struct vk_queue *vk_queue,
    struct anv_device *device = queue->device;
    VkResult result;
 
-   if (getenv("ANV_BRC_DEBUG_BATCH")) {
-      static uint32_t batch_dump_idx = 0;
-      for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
-         struct anv_cmd_buffer *cmd =
-            (struct anv_cmd_buffer *)submit->command_buffers[i];
-         uint32_t chunk = 0;
-
-         struct anv_batch_bo *bbo;
-         list_for_each_entry(struct anv_batch_bo, bbo, &cmd->batch_bos, link) {
-            if (getenv("ANV_BRC_DEBUG_BATCH_LIST")) {
-               fprintf(stderr, "anv batch %u chunk %u addr=0x%016" PRIx64
-                       " length=%u map=%p\n", batch_dump_idx, chunk,
-                       (uint64_t)bbo->bo->offset, bbo->length, bbo->bo->map);
-            }
-            if (bbo->bo->map == NULL || bbo->length == 0) {
-               chunk++;
-               continue;
-            }
-
-            char batch_name[80];
-            snprintf(batch_name, sizeof(batch_name),
-                     "/tmp/anv-batch-%04u-%u.bin", batch_dump_idx, chunk++);
-            FILE *bf = fopen(batch_name, "wb");
-            if (bf) {
-               fwrite(bbo->bo->map, 1, bbo->length, bf);
-               fclose(bf);
-            }
-         }
-         if (chunk > 0)
-            batch_dump_idx++;
-      }
-   }
-
    anv_queue_free_initial_submission(queue);
 
    if (u_trace_should_process(&device->ds.trace_context)) {
