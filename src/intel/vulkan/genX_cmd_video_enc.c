@@ -2707,7 +2707,11 @@ anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
 #define CMD1_BYTES(b0, b1, b2, b3) \
    ((uint32_t)(b0) | (uint32_t)(b1) << 8 | (uint32_t)(b2) << 16 | (uint32_t)(b3) << 24)
 
+#if GFX_VER >= 20
+   uint32_t v[GENX(VDENC_CMD1_length) - 1] = { 0 };
+#else
    uint32_t v[32] = { 0 };
+#endif
    v[0] = CMD1_BYTES(hevc_vdenc_cmd1_par2[0], hevc_vdenc_cmd1_par2[1],
                      hevc_vdenc_cmd1_par2[2], hevc_vdenc_cmd1_par2[3]);
    v[1] = CMD1_BYTES(hevc_vdenc_cmd1_par2[4], hevc_vdenc_cmd1_par2[5],
@@ -2735,8 +2739,47 @@ anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
    v[31] = CMD1_BYTES(par[90], par[91], par[92], 0);
 #undef CMD1_BYTES
 
+#if GFX_VER >= 20
+   /* Xe2 HPG (BMG) tuning on top of the common settings, from media-driver
+    * encode_hevc_vdenc_const_settings_xe2_hpm.cpp for target usage 4. The
+    * command grows to 39 dwords, dwords 33-38 hold the remaining entries of
+    * the par8-par15 arrays (mhw_vdbox_vdenc_impl_xe2_hpm.h).
+    */
+   static const uint8_t xe2_par8_15[8][4] = {
+      { 11, 14, 15, 17 }, /* par8 */
+      { 14, 17, 18, 19 }, /* par9 */
+      { 14, 17, 18, 19 }, /* par10 */
+      { 20, 23, 24, 25 }, /* par11 */
+      { 23, 26, 27, 29 }, /* par12 */
+      { 26, 29, 30, 31 }, /* par13 */
+      { 26, 29, 30, 31 }, /* par14 */
+      { 38, 41, 42, 43 }, /* par15 */
+   };
+#define PAR(n, i) ((uint32_t)xe2_par8_15[(n) - 8][i])
+   v[9]  = PAR(8, 0)  | PAR(12, 0) << 8 | PAR(9, 0)  << 16 | PAR(13, 0) << 24;
+   v[10] = PAR(10, 0) | PAR(14, 0) << 8 | PAR(11, 0) << 16 | PAR(15, 0) << 24;
+   v[32] = PAR(11, 1) | PAR(15, 3) << 8 | PAR(15, 2) << 16 | PAR(15, 1) << 24;
+   v[33] = PAR(14, 2) | PAR(14, 1) << 8 | PAR(11, 3) << 16 | PAR(11, 2) << 24;
+   v[34] = PAR(10, 3) | PAR(10, 2) << 8 | PAR(10, 1) << 16 | PAR(14, 3) << 24;
+   v[35] = PAR(9, 1)  | PAR(13, 3) << 8 | PAR(13, 2) << 16 | PAR(13, 1) << 24;
+   v[36] = PAR(12, 2) | PAR(12, 1) << 8 | PAR(9, 3)  << 16 | PAR(9, 2)  << 24;
+   v[37] = PAR(8, 3)  | PAR(8, 2)  << 8 | PAR(8, 1)  << 16 | PAR(12, 3) << 24;
+#undef PAR
+
+   /* par16-par21 and par23 */
+   v[11] = is_intra ? (92u | 23u << 8 | 92u << 16 | 21u << 24) :
+                      (110u | 26u << 8 | 110u << 16 | 24u << 24);
+   v[12] |= is_intra ? (23u | 42u << 24) : (26u | 54u << 24);
+   /* par36-par41, no ROI */
+   v[16] = is_intra ? (21u | 47u << 8 | 16u << 16 | 16u << 24) :
+                      (7u | 20u << 8 | 20u << 16 | 20u << 24);
+   v[17] = is_intra ? (30u | 30u << 8) : (30u | 68u << 8);
+   /* par95 */
+   v[8] |= 50u << 24;
+#endif
+
    anv_batch_emit(batch, GENX(VDENC_CMD1), cmd1) {
-      for (unsigned i = 0; i < 32; i++)
+      for (unsigned i = 0; i < ARRAY_SIZE(v); i++)
          cmd1.Values[i] = v[i];
    }
 #else
@@ -3188,6 +3231,44 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
       if (tbl_idx == 0 && frame_qp >= 22 && frame_qp <= 51)
          cmd2.Values26 = (cmd2.Values26 & 0xfe00ffff) |
                          (uint32_t)hevc_vdenc_cmd2_vqi_sad_lambda_i_gen12[frame_qp - 22] << 16;
+#endif
+
+#if GFX_VER >= 20
+      /* Xe2 HPG (BMG) values from media-driver's Xe2_HPM HEVC const settings.
+       * Target usage is fixed to 4, IBC / palette / RDOQ off, low delay mode
+       * follows the frame's low delay state.  Wa_22011549751 does not apply
+       * to BMG.
+       */
+      {
+         StdVideoH265PictureType std_pic_type = frame_info->pStdPictureInfo->pic_type;
+         uint32_t pic_type =
+            (std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_I ||
+             std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_IDR) ? 0 :
+            (std_pic_type == STD_VIDEO_H265_PICTURE_TYPE_P) ? 1 : 2;
+         const uint32_t target_usage = 4;
+         uint32_t low_delay = is_low_delay;
+         uint32_t num_l0_is0 = pic_type == 0 ? 1 : (ref_lists->num_ref_idx_l0_active_minus1 == 0);
+         uint32_t chroma_format_idc = MIN2(sps->chroma_format_idc, 3);
+
+         cmd2.Values2  |= 0x3;
+         cmd2.Values5  |= xe2_hevc_vdenc_cmd2_dw5[pic_type];
+         cmd2.Values7  |= xe2_hevc_vdenc_cmd2_dw7[pic_type][num_l0_is0][low_delay];
+         cmd2.Values8  |= xe2_hevc_vdenc_cmd2_dw8[pic_type][target_usage][low_delay][0][low_delay];
+         cmd2.Values9  |= xe2_hevc_vdenc_cmd2_dw9[pic_type][target_usage][low_delay][0][low_delay];
+         cmd2.Values12 |= xe2_hevc_vdenc_cmd2_dw12[target_usage];
+         cmd2.Values19 |= 0x98000000;
+         cmd2.Values23 |= 0xcccc0000;
+         cmd2.Values28 |= 0x07d00fa0;
+         cmd2.Values29 |= 0x02bc0bb8;
+         cmd2.Values30 |= 0x032003e8;
+         cmd2.Values31 |= 0x01f4012c;
+         cmd2.Values32 |= 0x190;
+         cmd2.Values35 |= 0xecc;
+         cmd2.Values52 |= xe2_hevc_vdenc_cmd2_dw51[target_usage][0][0];
+         cmd2.Values53 |= xe2_hevc_vdenc_cmd2_dw52[target_usage];
+         cmd2.Values54 |= xe2_hevc_vdenc_cmd2_dw53[target_usage];
+         cmd2.Values55 |= xe2_hevc_vdenc_cmd2_dw54[target_usage][0][0][chroma_format_idc];
+      }
 #endif
    }
 }
