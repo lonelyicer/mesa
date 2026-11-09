@@ -5951,8 +5951,10 @@ genX(cmd_buffer_emit_video_encode_feedback)(struct anv_cmd_buffer *cmd_buffer,
    struct anv_address bytes_addr = anv_address_add(query_addr, 8);
 
    /* VK_KHR_video_encode_feedback2 statistics of the encode that was just
-    * recorded, packed into the extra query slots.
+    * recorded, packed into the extra query slots.  Only write them when the
+    * query slot is large enough to hold them.
     */
+   if (pool->stride >= 48) {
    mi_store(&b, mi_mem32(anv_address_add(query_addr, 16)),
             mi_imm((uint32_t)cmd_buffer->video.feedback_avg_qp));
    mi_store(&b, mi_mem32(anv_address_add(query_addr, 20)),
@@ -5967,6 +5969,7 @@ genX(cmd_buffer_emit_video_encode_feedback)(struct anv_cmd_buffer *cmd_buffer,
             mi_imm(cmd_buffer->video.feedback_skipped_pixels));
    mi_store(&b, mi_mem32(anv_address_add(query_addr, 40)),
             mi_imm(cmd_buffer->video.feedback_picture_partition_count));
+   }
 
    if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR) {
       /* AV1 BITSTREAM_BYTECOUNT_TILE is per-tile; the frame total (all tiles)

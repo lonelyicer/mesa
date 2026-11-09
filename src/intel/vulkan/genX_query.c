@@ -1966,38 +1966,13 @@ void genX(CmdEndQueryIndexedEXT)(
       emit_query_mi_flush_availability(cmd_buffer, query_addr, true);
       break;
 
-#if GFX_VER < 11
-#define MFC_BITSTREAM_BYTECOUNT_FRAME_REG       0x128A0
-#define HCP_BITSTREAM_BYTECOUNT_FRAME_REG       0x1E9A0
-#elif GFX_VER >= 11
-#define MFC_BITSTREAM_BYTECOUNT_FRAME_REG       0x1C08A0
-#define HCP_BITSTREAM_BYTECOUNT_FRAME_REG       0x1C28A0
-#endif
-
-   case VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR: {
-      struct mi_value val;
-      if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
-         val = mi_reg32(MFC_BITSTREAM_BYTECOUNT_FRAME_REG);
-      } else if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
-         val = mi_reg32(HCP_BITSTREAM_BYTECOUNT_FRAME_REG);
-      } else if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR) {
-         /* AV1 BITSTREAM_BYTECOUNT_TILE is per-tile; the frame total (all
-          * tiles) is the running sum accumulated into the encode scratch
-          * dword during CmdEncodeVideoKHR. */
-         struct anv_video_session *vid = cmd_buffer->video.vid;
-         struct anv_address scratch = {
-            vid->vid_mem[ANV_VID_MEM_AV1_ENCODE_TILE_BITSTREAM_ACCUM].mem->bo,
-            vid->vid_mem[ANV_VID_MEM_AV1_ENCODE_TILE_BITSTREAM_ACCUM].offset
-         };
-         val = mi_mem32(scratch);
-      } else {
-         UNREACHABLE("Invalid codec operation");
-      }
-      mi_store(&b, mi_mem64(anv_address_add(query_addr, 8)), val);
-      emit_query_mi_availability(&b, query_addr, true);
-
+   case VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR:
+      /* The bitstream byte count lives in a media register that every VDBOX
+       * maps at its own CS MMIO base, so the read has to be emitted with
+       * AddCSMMIOStartOffset (see genX(cmd_buffer_emit_video_encode_feedback)).
+       */
+      genX(cmd_buffer_emit_video_encode_feedback)(cmd_buffer, pool, query_addr);
       break;
-   }
    default:
       UNREACHABLE("");
    }
