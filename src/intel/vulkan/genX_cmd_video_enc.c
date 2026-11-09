@@ -907,6 +907,22 @@ anv_h264_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
 #endif
    uint8_t dpb_idx[ANV_VIDEO_H264_MAX_NUM_REF_FRAME] = { 0,};
 
+   /* Independent pictures, notably the next IDR and the previous GOP's
+    * last P picture, can execute concurrently on different video queues.
+    * Session-wide row stores must not be shared between those encodes.
+    * Keep scratch alive with the command buffer, just like its batch.
+    */
+   const uint32_t width_in_mb = DIV_ROUND_UP(vid->vk.max_coded.width, ANV_MB_WIDTH);
+   const uint32_t scratch_factors[] = { 1, 4, 2, 2 };
+   struct anv_address scratch[ARRAY_SIZE(scratch_factors)];
+   for (unsigned i = 0; i < ARRAY_SIZE(scratch); i++) {
+      struct anv_state state = anv_cmd_buffer_alloc_temporary_state(
+         cmd, align(width_in_mb * 64 * scratch_factors[i], 4096), 4096);
+      if (state.map == NULL)
+         return;
+      scratch[i] = anv_cmd_buffer_temporary_state_address(cmd, state);
+   }
+
    const struct anv_image_view *base_ref_iv;
    uint32_t base_ref_array_layer;
    if (enc_info->pSetupReferenceSlot) {
@@ -1002,12 +1018,12 @@ anv_h264_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
          ANV_VID_ATTR(cmd->device, NULL);
 
       buf.IntraRowStoreScratchBufferAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_INTRA_ROW_STORE);
+         scratch[0];
       buf.IntraRowStoreScratchBufferAttributes =
          ANV_VID_ATTR(cmd->device, buf.IntraRowStoreScratchBufferAddress.bo);
 
       buf.DeblockingFilterRowStoreScratchAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_DEBLOCK_FILTER_ROW_STORE);
+         scratch[1];
       buf.DeblockingFilterRowStoreScratchAttributes =
          ANV_VID_ATTR(cmd->device,
                       buf.DeblockingFilterRowStoreScratchAddress.bo);
@@ -1061,7 +1077,7 @@ anv_h264_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
 
    anv_batch_emit(&cmd->batch, GENX(MFX_BSP_BUF_BASE_ADDR_STATE), bsp) {
       bsp.BSDMPCRowStoreScratchBufferAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_BSD_MPC_ROW_SCRATCH);
+         scratch[2];
 
       bsp.BSDMPCRowStoreScratchBufferAttributes =
          ANV_VID_ATTR(cmd->device, bsp.BSDMPCRowStoreScratchBufferAddress.bo);
@@ -1148,7 +1164,7 @@ anv_h264_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
       };
 
       vdenc_buf.RowStoreScratchBuffer.Address =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_MPR_ROW_SCRATCH);
+         scratch[3];
 
       vdenc_buf.RowStoreScratchBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
          .MOCS = anv_mocs(cmd->device, vdenc_buf.RowStoreScratchBuffer.Address.bo, 0),
@@ -2201,6 +2217,7 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
       cmd2.Values7  |= xe2_hevc_vdenc_cmd2_dw7[pic_type][num_l0_is0][low_delay];
       cmd2.Values8  |= xe2_hevc_vdenc_cmd2_dw8[pic_type][target_usage][low_delay][0][low_delay];
       cmd2.Values9  |= xe2_hevc_vdenc_cmd2_dw9[pic_type][target_usage][low_delay][0][low_delay];
+      cmd2.Values11 |= 0x80000000;
       cmd2.Values12 |= xe2_hevc_vdenc_cmd2_dw12[target_usage];
       cmd2.Values19 |= 0x98000000;
       cmd2.Values23 |= 0xcccc0000;
@@ -4434,7 +4451,6 @@ anv_h265_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
             vdenc_offsets.HEVCVP9WeightsBackwardReference0 = 1;
          }
       }
-
 
 #if GFX_VERx10 >= 125
        /* TODO: Different setting according to the target usage;
