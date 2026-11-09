@@ -216,7 +216,10 @@ anv_video_patch_encode_session_parameters(struct anv_device *device, struct vk_v
           * the CU QP delta path and PAK uses fractional QP), so cu_qp_delta
           * must be signalled in the PPS, so enabling it here keeps them consistent.
           */
-         pps->flags.cu_qp_delta_enabled_flag = 1;
+         /* The application may serialize its own PPS (ffmpeg does), so do
+          * not force cu_qp_delta on here: the bitstream and the hardware
+          * programming have to agree or the CABAC parser desyncs.
+          */
          pps->diff_cu_qp_delta_depth = 0;
 
          /* Set 0 where we don't advertise via stdSyntaxFlags */
