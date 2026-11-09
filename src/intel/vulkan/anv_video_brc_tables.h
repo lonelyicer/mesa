@@ -96,6 +96,6 @@ extern const uint32_t anv_hevc_brc_const_tables[900];
 
 #endif /* ANV_VIDEO_BRC_TABLES_H */
 
-/* HEVC RDOQ lambda tables (port of media-driver's const settings). */
+/* RDOQ lambda tables for HEVC_VP9_RDOQ_STATE (HEVC VDEnc). */
 extern const uint16_t anv_h265_rdoq_lambda_8bit[2][2][2][52];
 extern const uint16_t anv_h265_rdoq_lambda_10bit[2][2][2][64];

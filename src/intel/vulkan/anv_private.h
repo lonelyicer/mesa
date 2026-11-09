@@ -5096,6 +5096,23 @@ struct anv_cmd_buffer {
    struct {
       struct anv_video_session *vid;
       struct vk_video_session_parameters *params;
+      struct anv_state brc_dump_state;
+      struct anv_state brc_wp_dump_state;
+      struct anv_state brc_vdenc_stats_dump_state;
+      struct anv_state brc_frame_stats_dump_state;
+      struct anv_state brc_history_dump_state;
+      uint32_t brc_dump_fc;
+
+      /* VkVideoEncodeFeedback2KHR values of the most recent encode, read back
+       * by vkGetQueryPoolResults in the flag order of the query pool.
+       */
+      int32_t feedback_avg_qp;
+      int32_t feedback_min_qp;
+      int32_t feedback_max_qp;
+      uint32_t feedback_intra_pixels;
+      uint32_t feedback_inter_pixels;
+      uint32_t feedback_skipped_pixels;
+      uint32_t feedback_picture_partition_count;
    } video;
 
    /** List of anv_bvh_dump objects that get dumped on cmd buf completion */
@@ -6047,6 +6064,16 @@ struct anv_image {
    struct anv_image_memory_range vid_ds_8x_surface;
    struct anv_image_memory_range vid_ds_4x_surface;
 
+   /* HEVC VDENC 4x/8x HME downscaled surfaces. Packed NV12 as a 1.5x-tall
+    * R8 surface (UV starts at luma height). Tile-F, matching media-driver.
+    */
+   uint16_t vid_vdenc_ds4x_width;
+   uint16_t vid_vdenc_ds4x_height;
+   uint16_t vid_vdenc_ds8x_width;
+   uint16_t vid_vdenc_ds8x_height;
+   struct anv_surface vid_vdenc_ds4x;
+   struct anv_surface vid_vdenc_ds8x;
+
    /* Link in the anv_device.image_private_objects list */
    struct list_head link;
    /* Whether the image was added to anv_device.image_private_objects list */
@@ -6838,6 +6865,8 @@ struct anv_query_pool {
 
    /** Stride between queries, in bytes */
    uint32_t                                     stride;
+   /** VkQueryPoolVideoEncodeFeedbackCreateInfoKHR::encodeFeedbackFlags */
+   VkVideoEncodeFeedbackFlagsKHR                feedback_flags;
    /** Number of slots in this query pool */
    struct anv_bo *                              bo;
 
@@ -7060,6 +7089,7 @@ enum anv_vid_mem_h265_types {
    ANV_VID_MEM_H265_VDENC_STATS_STREAMOUT,
    ANV_VID_MEM_H265_VDENC_TILE_ROW_STORE,
    ANV_VID_MEM_H265_VDENC_CU_COUNT_STREAMOUT,
+   ANV_VID_MEM_H265_VDENC_CUMULATIVE_CU_COUNT,
    ANV_VID_MEM_H265_MB_CODE,
    ANV_VID_MEM_H265_FRAME_STATS_STREAMOUT,
    ANV_VID_MEM_H265_LCU_ILDB_STREAMOUT,
@@ -7133,23 +7163,48 @@ enum anv_vid_mem_av1_types {
    ANV_VID_MEM_AV1_TILE_SIZE_STREAMOUT,
    ANV_VID_MEM_AV1_ENCODE_TILE_BITSTREAM_ACCUM,
    ANV_VID_MEM_AV1_MAX,
-};
 
-/* HuC BRC session buffers, shared by the encode codecs. Based past every
- * per-codec range so they never collide in vid_mem[].
- */
-enum anv_vid_mem_brc_types {
+   /* HuC BRC session buffers, shared by the encode codecs. Based past every
+    * codec-specific range.
+    */
    ANV_VID_MEM_BRC_HISTORY = ANV_VID_MEM_AV1_MAX,
    ANV_VID_MEM_BRC_VDENC_STATS,
    ANV_VID_MEM_BRC_EXEC_SLB,
+   ANV_VID_MEM_BRC_EXEC_SLB_1,
+   ANV_VID_MEM_BRC_EXEC_SLB_2,
+   ANV_VID_MEM_BRC_EXEC_SLB_3,
+   ANV_VID_MEM_BRC_EXEC_SLB_4,
+   ANV_VID_MEM_BRC_EXEC_SLB_5,
    ANV_VID_MEM_BRC_WP_DATA,
    ANV_VID_MEM_BRC_PAK_INFO,
    ANV_VID_MEM_BRC_PAK_STATS,
    ANV_VID_MEM_BRC_DEBUG,
    ANV_VID_MEM_BRC_PAK_MMIO_SEM,
    ANV_VID_MEM_BRC_HUC_ERR_SEM,
+   /* ROI data the HuC BRC update packet binds unconditionally.  Region 11 is
+    * an output, so it is sized like media-driver's m_roiStreamInBufferSize.
+    */
+   ANV_VID_MEM_BRC_ROI_STREAMIN,
+   ANV_VID_MEM_BRC_ROI_DELTA_QP,
+   ANV_VID_MEM_BRC_ROI_OUT,
+   /* HuC PAK integrate kernel (descriptor 15) in/out buffers. */
+   ANV_VID_MEM_BRC_HUC_STATS_OUT,
+   ANV_VID_MEM_BRC_DATA,
+   ANV_VID_MEM_BRC_TILE_RECORD,
    ANV_VID_MEM_BRC_MAX,
 };
+
+#define ANV_VIDEO_H265_FRAME_SLOTS 8
+
+struct anv_address anv_video_h265_line_addr(struct anv_video_session *vid,
+                                            uint32_t mem_idx, uint32_t slot);
+uint32_t anv_video_h265_line_stride(struct anv_video_session *vid,
+                                    uint32_t mem_idx);
+
+/* HuC BRC session buffers, shared by the encode codecs. Based past every
+ * per-codec range so they never collide in vid_mem[].
+ */
+
 
 static_assert((unsigned)ANV_VID_MEM_H264_MAX <= (unsigned)ANV_VID_MEM_AV1_MAX,
               "H.264 video memory range overlaps the BRC range");
@@ -7161,6 +7216,15 @@ static_assert((unsigned)ANV_VID_MEM_VP9_DEC_MAX <= (unsigned)ANV_VID_MEM_AV1_MAX
 #define ANV_VID_MEM_ADDR(vid_, type_)                                        \
    (struct anv_address) { (vid_)->vid_mem[type_].mem->bo,                    \
                           (vid_)->vid_mem[type_].offset }
+
+#define anv_brc_exec_slb_addr(vid_)                                          \
+   ANV_VID_MEM_ADDR(vid_,                                                    \
+      (vid_)->rc.brc_exec_slb_idx == 0 ? ANV_VID_MEM_BRC_EXEC_SLB :          \
+      (vid_)->rc.brc_exec_slb_idx == 1 ? ANV_VID_MEM_BRC_EXEC_SLB_1 :        \
+      (vid_)->rc.brc_exec_slb_idx == 2 ? ANV_VID_MEM_BRC_EXEC_SLB_2 :        \
+      (vid_)->rc.brc_exec_slb_idx == 3 ? ANV_VID_MEM_BRC_EXEC_SLB_3 :        \
+      (vid_)->rc.brc_exec_slb_idx == 4 ? ANV_VID_MEM_BRC_EXEC_SLB_4 :        \
+                                         ANV_VID_MEM_BRC_EXEC_SLB_5)
 
 #define ANV_VID_ATTR(dev_, bo_, ...)                                         \
    (struct GENX(MEMORYADDRESSATTRIBUTES)) {                                  \
@@ -7216,6 +7280,9 @@ struct anv_video_rc_state {
    /* H.264 and H.265 rate control flag bits share the same values. */
    uint32_t rc_flags;
    uint32_t frame_counter;
+   /* Xe2 HuC BRC weighted-prediction picture data slots. */
+   uint32_t brc_wp_poc[16];
+   uint32_t brc_exec_slb_idx;
 };
 
 struct anv_video_session {
@@ -7225,10 +7292,19 @@ struct anv_video_session {
    VkVideoEncodeRateControlModeFlagBitsKHR rc_mode;
    /* VK_KHR_video_encode_intra_refresh */
    VkVideoEncodeIntraRefreshModeFlagBitsKHR intra_refresh_mode;
+   /* Per in-flight frame rotation of the HEVC session scratch buffers. */
+   uint32_t h265_frame_count;
+   uint32_t h265_slot;
    struct anv_video_rc_state rc;
 
    /* the decoder needs some private memory allocations */
    struct anv_vid_mem vid_mem[ANV_VID_MEM_BRC_MAX];
+   /* Debug: host visible BO written by MI_STORE_DATA_IMM at checkpoints of
+    * the encode batch, so the CPU can tell how far a hung batch got.
+    */
+   struct anv_bo *brc_marker_bo;
+   uint32_t *brc_marker_map;
+
    struct anv_av1_video_refs_info prev_refs[ANV_VIDEO_AV1_MAX_DPB_SLOTS];
 
    /* For VP9 decoding from here */
@@ -7400,6 +7476,14 @@ anv_image_ds_4x_address(const struct anv_image_view *iv,
 
    return anv_address_add(addr, iv->image->vid_ds_4x_array_pitch_B *
                                     ((uint64_t)iv->vk.base_array_layer + arrayLayer));
+}
+
+static inline struct anv_address MUST_CHECK
+anv_image_vdenc_ds_address(const struct anv_image_view *iv,
+                           uint32_t arrayLayer, bool is_8x)
+{
+   return is_8x ? anv_image_ds_8x_address(iv, arrayLayer)
+                : anv_image_ds_4x_address(iv, arrayLayer);
 }
 
 static inline struct anv_address MUST_CHECK

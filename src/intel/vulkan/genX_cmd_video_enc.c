@@ -22,6 +22,7 @@
  */
 
 #include "anv_private.h"
+#include "anv_video_brc_tables.h"
 
 #include "genxml/gen_macros.h"
 #include "genxml/genX_video_pack.h"
@@ -29,12 +30,15 @@
 #define MI_BUILDER_CAN_WRITE_BATCH false
 #include "genX_mi_builder.h"
 
+#if GFX_VER >= 12
+static void anv_video_emit_mi_flush_dw(struct anv_cmd_buffer *cmd, bool cache_invalidate);
+#include "genX_huc_brc.h"
+#endif
+
+#if GFX_VERx10 >= 125
 #include "h264_vdenc_tables.h"
 #include "h265_vdenc_tables.h"
 #include "av1_vdenc_tables.h"
-
-#if GFX_VER >= 12
-#include "genX_huc_brc.h"
 #endif
 
 static int
@@ -110,28 +114,276 @@ anv_vdenc_h264_picture_type(StdVideoH264PictureType pic_type)
 static uint8_t
 anv_vdenc_h265_picture_type(StdVideoH265PictureType pic_type)
 {
-   if (pic_type == STD_VIDEO_H265_PICTURE_TYPE_I || pic_type == STD_VIDEO_H265_PICTURE_TYPE_IDR) {
+   /* Index into the VDENC_CMD2 / BRC tables: 0 = I, 1 = P, 2 = B, matching
+    * media-driver's CodingType.  Mapping P to 2 made every P frame use the
+    * B row of dw5/dw7/dw8/dw9.
+    */
+   if (pic_type == STD_VIDEO_H265_PICTURE_TYPE_I || pic_type == STD_VIDEO_H265_PICTURE_TYPE_IDR)
       return 0;
-   } else {
-      return 2;
-   }
+   if (pic_type == STD_VIDEO_H265_PICTURE_TYPE_P)
+      return 1;
+   return 2;
 }
-
-static uint32_t
-anv_video_encode_quantizer(const struct anv_video_session *vid,
-                           uint32_t constant, uint32_t driver_default)
-{
-   switch (vid->rc_mode) {
-   case VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR:
-      return constant;
-   case VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR:
-   default:
-      return driver_default;
-   }
-}
-
 
 #if GFX_VERx10 < 125
+static const uint8_t vdenc_const_qp_lambda[42] = {
+   0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x02, 0x02,
+   0x02, 0x03, 0x03, 0x03, 0x04, 0x04, 0x05, 0x05, 0x06, 0x07,
+   0x07, 0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x0f, 0x11, 0x13, 0x15,
+   0x17, 0x1a, 0x1e, 0x21, 0x25, 0x2a, 0x2f, 0x35, 0x3b, 0x42,
+   0x4a, 0x53,
+};
+
+/* P frame */
+static const uint8_t vdenc_const_qp_lambda_p[42] = {
+   0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x02, 0x02,
+   0x02, 0x03, 0x03, 0x03, 0x04, 0x04, 0x05, 0x05, 0x06, 0x07,
+   0x07, 0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x0f, 0x11, 0x13, 0x15,
+   0x17, 0x1a, 0x1e, 0x21, 0x25, 0x2a, 0x2f, 0x35, 0x3b, 0x42,
+   0x4a, 0x53,
+};
+
+static const uint16_t vdenc_const_skip_threshold_p[27] = {
+   0x0000, 0x0000, 0x0000, 0x0000, 0x0002, 0x0004, 0x0007, 0x000b,
+   0x0011, 0x0019, 0x0023, 0x0032, 0x0044, 0x005b, 0x0077, 0x0099,
+   0x00c2, 0x00f1, 0x0128, 0x0168, 0x01b0, 0x0201, 0x025c, 0x02c2,
+   0x0333, 0x03b0, 0x0000,
+};
+
+static const uint16_t vdenc_const_sic_forward_transform_coeff_threshold_0_p[27] = {
+   0x02, 0x02, 0x03, 0x04, 0x04, 0x05, 0x07, 0x09, 0x0b, 0x0e,
+   0x12, 0x14, 0x18, 0x1d, 0x20, 0x25, 0x2a, 0x34, 0x39, 0x3f,
+   0x4e, 0x51, 0x5b, 0x63, 0x6f, 0x7f, 0x00,
+};
+
+static const uint8_t vdenc_const_sic_forward_transform_coeff_threshold_1_p[27] = {
+   0x03, 0x04, 0x05, 0x05, 0x07, 0x09, 0x0b, 0x0e, 0x12, 0x17,
+   0x1c, 0x21, 0x27, 0x2c, 0x33, 0x3b, 0x41, 0x51, 0x5c, 0x1a,
+   0x1e, 0x21, 0x22, 0x26, 0x2c, 0x30, 0x00,
+};
+
+static const uint8_t vdenc_const_sic_forward_transform_coeff_threshold_2_p[27] = {
+   0x02, 0x02, 0x03, 0x04, 0x04, 0x05, 0x07, 0x09, 0x0b, 0x0e,
+   0x12, 0x14, 0x18, 0x1d, 0x20, 0x25, 0x2a, 0x34, 0x39, 0x0f,
+   0x13, 0x14, 0x16, 0x18, 0x1b, 0x1f, 0x00,
+};
+
+static const uint8_t vdenc_const_sic_forward_transform_coeff_threshold_3_p[27] = {
+   0x04, 0x05, 0x06, 0x09, 0x0b, 0x0d, 0x12, 0x16, 0x1b, 0x23,
+   0x2c, 0x33, 0x3d, 0x45, 0x4f, 0x5b, 0x66, 0x7f, 0x8e, 0x2a,
+   0x2f, 0x32, 0x37, 0x3c, 0x45, 0x4c, 0x00,
+};
+
+static const int vdenc_mode_const[2][12][52] = {
+    //INTRASLICE
+    {
+        //LUTMODE_INTRA_NONPRED
+        {
+            14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,         //QP=[0 ~12]
+            16, 18, 22, 24, 13, 15, 16, 18, 13, 15, 15, 12, 14,         //QP=[13~25]
+            12, 12, 10, 10, 11, 10, 10, 10, 9, 9, 8, 8, 8,              //QP=[26~38]
+            8, 8, 8, 8, 8, 8, 8, 8, 7, 7, 7, 7, 7,                      //QP=[39~51]
+        },
+
+        //LUTMODE_INTRA_16x16, LUTMODE_INTRA
+        {
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[0 ~12]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[13~25]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[26~38]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[39~51]
+        },
+
+        //LUTMODE_INTRA_8x8
+        {
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  //QP=[0 ~12]
+            0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1,  //QP=[13~25]
+            1, 1, 1, 1, 1, 4, 4, 4, 4, 6, 6, 6, 6,  //QP=[26~38]
+            6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7,  //QP=[39~51]
+        },
+
+        //LUTMODE_INTRA_4x4
+        {
+            56, 56, 56, 56, 56, 56, 56, 56, 56, 56, 56, 56, 56,   //QP=[0 ~12]
+            64, 72, 80, 88, 48, 56, 64, 72, 53, 59, 64, 56, 64,   //QP=[13~25]
+            57, 64, 58, 55, 64, 64, 64, 64, 59, 59, 60, 57, 50,   //QP=[26~38]
+            46, 42, 38, 34, 31, 27, 23, 22, 19, 18, 16, 14, 13,   //QP=[39~51]
+        },
+
+        //LUTMODE_INTER_16x8, LUTMODE_INTER_8x16
+        { 0, },
+
+        //LUTMODE_INTER_8X8Q
+        { 0, },
+
+        //LUTMODE_INTER_8X4Q, LUTMODE_INTER_4X8Q, LUTMODE_INTER_16x8_FIELD
+        { 0, },
+
+        //LUTMODE_INTER_4X4Q, LUTMODE_INTER_8X8_FIELD
+        { 0, },
+
+        //LUTMODE_INTER_16x16, LUTMODE_INTER
+        { 0, },
+
+        //LUTMODE_INTER_BWD
+        { 0, },
+
+        //LUTMODE_REF_ID
+        { 0, },
+
+        //LUTMODE_INTRA_CHROMA
+        { 0, },
+    },
+
+    //PREDSLICE
+    {
+        //LUTMODE_INTRA_NONPRED
+        {
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,     //QP=[0 ~12]
+            7, 8, 9, 10, 5, 6, 7, 8, 6, 7, 7, 7, 7,    //QP=[13~25]
+            6, 7, 7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7,     //QP=[26~38]
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,     //QP=[39~51]
+        },
+
+        //LUTMODE_INTRA_16x16, LUTMODE_INTRA
+        {
+            21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+            24, 28, 31, 35, 19, 21, 24, 28, 20, 24, 25, 21, 24,
+            24, 24, 24, 21, 24, 24, 26, 24, 24, 24, 24, 24, 24,
+            24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+
+        },
+
+        //LUTMODE_INTRA_8x8
+        {
+            26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,   //QP=[0 ~12]
+            28, 32, 36, 40, 22, 26, 28, 32, 24, 26, 30, 26, 28,   //QP=[13~25]
+            26, 28, 26, 26, 30, 28, 28, 28, 26, 28, 28, 26, 28,   //QP=[26~38]
+            28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,   //QP=[39~51]
+        },
+
+        //LUTMODE_INTRA_4x4
+        {
+            64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,   //QP=[0 ~12]
+            72, 80, 88, 104, 56, 64, 72, 80, 58, 68, 76, 64, 68,  //QP=[13~25]
+            64, 68, 68, 64, 70, 70, 70, 70, 68, 68, 68, 68, 68,   //QP=[26~38]
+            68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68,   //QP=[39~51]
+        },
+
+        //LUTMODE_INTER_16x8, LUTMODE_INTER_8x16
+        {
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,      //QP=[0 ~12]
+            8, 9, 11, 12, 6, 7, 9, 10, 7, 8, 9, 8, 9,   //QP=[13~25]
+            8, 9, 8, 8, 9, 9, 9, 9, 8, 8, 8, 8, 8,      //QP=[26~38]
+            8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,      //QP=[39~51]
+        },
+
+        //LUTMODE_INTER_8X8Q
+        {
+            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,   //QP=[0 ~12]
+            2, 3, 3, 3, 2, 2, 2, 3, 2, 2, 2, 2, 3,   //QP=[13~25]
+            2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,   //QP=[26~38]
+            3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,   //QP=[39~51]
+        },
+
+        //LUTMODE_INTER_8X4Q, LUTMODE_INTER_4X8Q, LUTMODE_INTER_16X8_FIELD
+        {
+            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,   //QP=[0 ~12]
+            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,   //QP=[13~25]
+            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,   //QP=[26~38]
+            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,   //QP=[39~51]
+        },
+
+        //LUTMODE_INTER_4X4Q, LUTMODE_INTER_8x8_FIELD
+        {
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,   //QP=[0 ~12]
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,   //QP=[13~25]
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,   //QP=[26~38]
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,   //QP=[39~51]
+        },
+
+        //LUTMODE_INTER_16x16, LUTMODE_INTER
+        {
+            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,   //QP=[0 ~12]
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,   //QP=[13~25]
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,   //QP=[26~38]
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,   //QP=[39~51]
+        },
+
+        //LUTMODE_INTER_BWD
+        {
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[0 ~12]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[13~25]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[26~38]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[39~51]
+        },
+
+        //LUTMODE_REF_ID
+        {
+            4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,    //QP=[0 ~12]
+            4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,    //QP=[13~25]
+            4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,    //QP=[26~38]
+            4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,    //QP=[39~51]
+        },
+
+        //LUTMODE_INTRA_CHROMA
+        {
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[0 ~12]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[13~25]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[26~38]
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    //QP=[39~51]
+        },
+    },
+};
+
+
+#define VDENC_LUTMODE_INTRA_NONPRED             0x00
+#define VDENC_LUTMODE_INTRA                     0x01
+#define VDENC_LUTMODE_INTRA_16x16               0x01
+#define VDENC_LUTMODE_INTRA_8x8                 0x02
+#define VDENC_LUTMODE_INTRA_4x4                 0x03
+#define VDENC_LUTMODE_INTER_16x8                0x04
+#define VDENC_LUTMODE_INTER_8x16                0x04
+#define VDENC_LUTMODE_INTER_8X8Q                0x05
+#define VDENC_LUTMODE_INTER_8X4Q                0x06
+#define VDENC_LUTMODE_INTER_4X8Q                0x06
+#define VDENC_LUTMODE_INTER_16x8_FIELD          0x06
+#define VDENC_LUTMODE_INTER_4X4Q                0x07
+#define VDENC_LUTMODE_INTER_8x8_FIELD           0x07
+#define VDENC_LUTMODE_INTER                     0x08
+#define VDENC_LUTMODE_INTER_16x16               0x08
+#define VDENC_LUTMODE_INTER_BWD                 0x09
+#define VDENC_LUTMODE_REF_ID                    0x0A
+#define VDENC_LUTMODE_INTRA_CHROMA              0x0B
+
+static unsigned char
+map_44_lut_value(unsigned int v, unsigned char max)
+{
+    unsigned int maxcost;
+    int d;
+    unsigned char ret;
+
+    if (v == 0) {
+        return 0;
+    }
+
+    maxcost = ((max & 15) << (max >> 4));
+
+    if (v >= maxcost) {
+        return max;
+    }
+
+    d = (int)(log((double)v) / log(2.0)) - 3;
+
+    if (d < 0) {
+        d = 0;
+    }
+
+    ret = (unsigned char)((d << 4) + (int)((v + (d == 0 ? 0 : (1 << (d - 1)))) >> d));
+    ret = (ret & 0xf) == 0 ? (ret | 8) : ret;
+
+    return ret;
+}
+
 static void update_costs(uint8_t *mode_cost, uint8_t *mv_cost, uint8_t *hme_mv_cost, int qp, StdVideoH264PictureType pic_type)
 {
    int frame_type = anv_vdenc_h264_picture_type(pic_type);
@@ -178,797 +430,22 @@ anv_h264_dpb_slot_poc(const VkVideoEncodeInfoKHR *enc_info, uint8_t slot_index)
    return 0;
 }
 
-static bool
-anv_h264_ref_slot_is_intra(const VkVideoReferenceSlotInfoKHR *slot)
-{
-   const VkVideoEncodeH264DpbSlotInfoKHR *dpb =
-      vk_find_struct_const(slot->pNext, VIDEO_ENCODE_H264_DPB_SLOT_INFO_KHR);
-   if (!dpb || !dpb->pStdReferenceInfo)
-      return false;
-   return dpb->pStdReferenceInfo->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_I ||
-          dpb->pStdReferenceInfo->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_IDR;
-}
-
-static const struct anv_image_view *
-anv_video_enc_base_ref(const VkVideoEncodeInfoKHR *enc_info, uint32_t *array_layer)
-{
-   if (enc_info->pSetupReferenceSlot) {
-      *array_layer = enc_info->pSetupReferenceSlot->pPictureResource->baseArrayLayer;
-      return anv_image_view_from_handle(enc_info->pSetupReferenceSlot->pPictureResource->imageViewBinding);
-   }
-
-   *array_layer = enc_info->srcPictureResource.baseArrayLayer;
-   return anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-}
-
-static void
-anv_video_emit_mi_flush_dw(struct anv_cmd_buffer *cmd, bool cache_invalidate)
-{
-   anv_batch_emit(&cmd->batch, GENX(MI_FLUSH_DW), flush) {
-      flush.VideoPipelineCacheInvalidate = cache_invalidate;
-   }
-}
-
-static void
-anv_vdenc_emit_vd_pipeline_flush(struct anv_cmd_buffer *cmd)
-{
-   anv_batch_emit(&cmd->batch, GENX(VD_PIPELINE_FLUSH), flush) {
-      flush.MFXPipelineDone = true;
-      flush.VDENCPipelineDone = true;
-      flush.VDCommandMessageParserDone = true;
-      flush.VDENCPipelineCommandFlush = true;
-   }
-}
-
-#if GFX_VER >= 12
-static void
-anv_video_emit_force_wakeup(struct anv_cmd_buffer *cmd, bool hevc_power_well)
-{
-   anv_batch_emit(&cmd->batch, GENX(MI_FORCE_WAKEUP), wake) {
-      wake.MFXPowerWellControl = 1;
-      if (hevc_power_well)
-         wake.HEVCPowerWellControl = 1;
-      wake.MaskBits = 768;
-   }
-}
-
-static void
-anv_video_emit_mfx_wait(struct anv_cmd_buffer *cmd, struct anv_batch *batch)
-{
-   if (!batch)
-      batch = &cmd->batch;
-
-   anv_batch_emit(batch, GENX(MFX_WAIT), mfx) {
-      mfx.MFXSyncControlFlag = 1;
-   }
-}
-
-static void
-anv_vdenc_emit_control_state(struct anv_cmd_buffer *cmd)
-{
-   anv_batch_emit(&cmd->batch, GENX(VDENC_CONTROL_STATE), v) {
-      v.VdencInitialization = true;
-   }
-}
-
-static void
-anv_video_emit_vd_control_state(struct anv_cmd_buffer *cmd)
-{
-   anv_batch_emit(&cmd->batch, GENX(VD_CONTROL_STATE), v) {
-      v.PipelineInitialization = true;
-   }
-}
-#endif
-
-static struct GENX(VDENC_SURFACE_STATE_FIELDS)
-anv_vdenc_surface_state(const struct anv_image *img, uint32_t width,
-                        uint32_t height, bool is_10bit)
-{
-   const struct isl_surf *y_surf = &img->planes[0].primary_surface.isl;
-   uint32_t uv_y_offset =
-      img->planes[1].primary_surface.memory_range.offset / y_surf->row_pitch_B;
-
-#if GFX_VER < 11
-   assert(!is_10bit);
-#endif
-
-   return (struct GENX(VDENC_SURFACE_STATE_FIELDS)) {
-      .Width = width - 1,
-      .Height = height - 1,
-#if GFX_VER >= 11
-      .SurfaceFormat = is_10bit ? VDENC_P010 : VDENC_PLANAR_420_8,
-#else
-      .SurfaceFormat = VDENC_PLANAR_420_8,
-#endif
-#if GFX_VER == 9
-      .InterleaveChroma = true,
-#endif
-      .SurfacePitch = y_surf->row_pitch_B - 1,
-      .TileWalk = TW_YMAJOR,
-      .TiledSurface = y_surf->tiling != ISL_TILING_LINEAR,
-      .YOffsetforUCb = uv_y_offset,
-      .YOffsetforVCr = uv_y_offset,
-   };
-}
-
-static void
-anv_vdenc_emit_weightsoffsets_state(struct anv_cmd_buffer *cmd,
-                                    struct anv_batch *batch,
-                                    bool chroma)
-{
-   if (!batch)
-      batch = &cmd->batch;
-   anv_batch_emit(batch, GENX(VDENC_WEIGHTSOFFSETS_STATE), vdenc_offsets) {
-      vdenc_offsets.WeightsForwardReference0 = 1;
-      vdenc_offsets.WeightsForwardReference1 = 1;
-      vdenc_offsets.WeightsForwardReference2 = 1;
-      vdenc_offsets.HEVCVP9WeightsBackwardReference0 = 1;
-#if GFX_VERx10 >= 125
-      if (chroma) {
-         vdenc_offsets.CbWeightsForwardReference0 = 1;
-         vdenc_offsets.CbWeightsForwardReference1 = 1;
-         vdenc_offsets.CbWeightsForwardReference2 = 1;
-         vdenc_offsets.CbWeightsBackwardReference0 = 1;
-         vdenc_offsets.CrWeightsForwardReference0 = 1;
-         vdenc_offsets.CrWeightsForwardReference1 = 1;
-         vdenc_offsets.CrWeightsForwardReference2 = 1;
-         vdenc_offsets.CrWeightsBackwardReference0 = 1;
-      }
-#else
-      assert(!chroma);
-#endif
-   }
-}
-
-struct anv_vdenc_pipe_buf {
-   struct anv_address src;
-   struct anv_address row_store;
-   struct anv_address col_mv_read;
-   struct anv_address fwd_ref[3];
-   struct anv_address bwd_ref;
-   struct anv_address col_mv_avc_write;
-   struct anv_address ds_fwd_ref[2];
-   struct anv_address ds_fwd_ref_4x[2];
-   struct anv_address ds_bwd_ref;
-   struct anv_address ds_bwd_ref_4x;
-   struct anv_address scaled_8x;
-   struct anv_address scaled_4x;
-   struct anv_address stats;
-   struct anv_address pak_obj;
-   struct anv_address tile_row_store;
-   struct anv_address cu_count;
-};
-
-static void
-anv_vdenc_emit_ds_ref_surface_state(struct anv_cmd_buffer *cmd,
-                                    struct anv_video_enc_ds_layout ds,
-                                    bool dual_stage)
-{
-   uint32_t w0 = dual_stage ? ds.w8 : ds.w4;
-   uint32_t h0 = dual_stage ? ds.h8 : ds.h4;
-   uint32_t pitch0 = dual_stage ? ds.pitch8 : ds.pitch4;
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_DS_REF_SURFACE_STATE), surf) {
-      surf.SurfaceState0.Width = w0 - 1;
-      surf.SurfaceState0.Height = h0 - 1;
-      surf.SurfaceState0.SurfaceFormat = VDENC_PLANAR_420_8;
-      surf.SurfaceState0.TileWalk = TW_YMAJOR;
-      surf.SurfaceState0.TiledSurface = true;
-      surf.SurfaceState0.SurfacePitch = pitch0 - 1;
-      surf.SurfaceState0.YOffsetforUCb = h0;
-      surf.SurfaceState0.YOffsetforVCr = h0;
-
-#if GFX_VER >= 11
-      if (dual_stage) {
-         surf.SurfaceState1.Width = ds.w4 - 1;
-         surf.SurfaceState1.Height = ds.h4 - 1;
-         surf.SurfaceState1.SurfaceFormat = VDENC_PLANAR_420_8;
-         surf.SurfaceState1.TileWalk = TW_YMAJOR;
-         surf.SurfaceState1.TiledSurface = true;
-         surf.SurfaceState1.SurfacePitch = ds.pitch4 - 1;
-         surf.SurfaceState1.YOffsetforUCb = ds.h4;
-         surf.SurfaceState1.YOffsetforVCr = ds.h4;
-      }
-#else
-      assert(!dual_stage);
-#endif
-   }
-}
-
-static void
-anv_vdenc_emit_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
-                                   const struct anv_vdenc_pipe_buf *p)
-{
-   anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_BUF_ADDR_STATE), vdenc_buf) {
-      vdenc_buf.DSFWDREF0.Address = p->ds_fwd_ref[0];
-      vdenc_buf.DSFWDREF0.PictureFields = ANV_VID_PIC(cmd->device, p->ds_fwd_ref[0].bo);
-      vdenc_buf.DSFWDREF1.Address = p->ds_fwd_ref[1];
-      vdenc_buf.DSFWDREF1.PictureFields = ANV_VID_PIC(cmd->device, p->ds_fwd_ref[1].bo);
-#if GFX_VERx10 >= 125
-      vdenc_buf.DSBWDREF0.Address = p->ds_bwd_ref;
-      vdenc_buf.DSBWDREF0.PictureFields = ANV_VID_PIC(cmd->device, p->ds_bwd_ref.bo);
-#endif
-
-      vdenc_buf.OriginalUncompressedPicture.Address = p->src;
-      vdenc_buf.OriginalUncompressedPicture.PictureFields =
-         ANV_VID_PIC(cmd->device, p->src.bo);
-
-      vdenc_buf.StreamInDataPicture.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-
-      vdenc_buf.RowStoreScratchBuffer.Address = p->row_store;
-      vdenc_buf.RowStoreScratchBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, p->row_store.bo);
-
-      vdenc_buf.ColocatedMVReadBuffer.Address = p->col_mv_read;
-      vdenc_buf.ColocatedMVReadBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, p->col_mv_read.bo);
-
-      vdenc_buf.FWDREF0.Address = p->fwd_ref[0];
-      vdenc_buf.FWDREF0.PictureFields = ANV_VID_PIC(cmd->device, p->fwd_ref[0].bo);
-      vdenc_buf.FWDREF1.Address = p->fwd_ref[1];
-      vdenc_buf.FWDREF1.PictureFields = ANV_VID_PIC(cmd->device, p->fwd_ref[1].bo);
-      vdenc_buf.FWDREF2.Address = p->fwd_ref[2];
-      vdenc_buf.FWDREF2.PictureFields = ANV_VID_PIC(cmd->device, p->fwd_ref[2].bo);
-      vdenc_buf.BWDREF0.Address = p->bwd_ref;
-      vdenc_buf.BWDREF0.PictureFields = ANV_VID_PIC(cmd->device, p->bwd_ref.bo);
-
-      vdenc_buf.VDEncStatisticsStreamOut.Address = p->stats;
-      vdenc_buf.VDEncStatisticsStreamOut.PictureFields =
-         ANV_VID_PIC(cmd->device, p->stats.bo);
-
-#if GFX_VER >= 11
-      vdenc_buf.DSFWDREF04X.Address = p->ds_fwd_ref_4x[0];
-      vdenc_buf.DSFWDREF04X.PictureFields =
-         ANV_VID_PIC(cmd->device, p->ds_fwd_ref_4x[0].bo);
-      vdenc_buf.DSFWDREF14X.Address = p->ds_fwd_ref_4x[1];
-      vdenc_buf.DSFWDREF14X.PictureFields =
-         ANV_VID_PIC(cmd->device, p->ds_fwd_ref_4x[1].bo);
-#if GFX_VERx10 < 125
-      vdenc_buf.VDEncCURecordStreamOutBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-#else
-      vdenc_buf.DSBWDREF04X.Address = p->ds_bwd_ref_4x;
-      vdenc_buf.DSBWDREF04X.PictureFields =
-         ANV_VID_PIC(cmd->device, p->ds_bwd_ref_4x.bo);
-#endif
-      vdenc_buf.VDEncLCUPAK_OBJ_CMDBuffer.Address = p->pak_obj;
-      vdenc_buf.VDEncLCUPAK_OBJ_CMDBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, p->pak_obj.bo);
-      vdenc_buf.ScaledReferenceSurface8X.Address = p->scaled_8x;
-      vdenc_buf.ScaledReferenceSurface8X.PictureFields =
-         ANV_VID_PIC(cmd->device, p->scaled_8x.bo);
-      vdenc_buf.ScaledReferenceSurface4X.Address = p->scaled_4x;
-      vdenc_buf.ScaledReferenceSurface4X.PictureFields =
-         ANV_VID_PIC(cmd->device, p->scaled_4x.bo);
-      vdenc_buf.VP9SegmentationMapStreamInBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.VP9SegmentationMapStreamOutBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-#endif
-#if GFX_VER >= 12
-      vdenc_buf.VDEncTileRowStoreBuffer.Address = p->tile_row_store;
-      vdenc_buf.VDEncTileRowStoreBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, p->tile_row_store.bo);
-      vdenc_buf.VDEncCumulativeCUCountStreamOutSurface.Address = p->cu_count;
-      vdenc_buf.VDEncCumulativeCUCountStreamOutSurface.PictureFields =
-         ANV_VID_PIC(cmd->device, p->cu_count.bo);
-      vdenc_buf.VDEncPaletteModeStreamOutSurface.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-#endif
-
-#if GFX_VERx10 >= 125
-      vdenc_buf.IntraPredictionRowStoreBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.ColocatedMVAVCWriteBuffer.Address = p->col_mv_avc_write;
-      vdenc_buf.ColocatedMVAVCWriteBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, p->col_mv_avc_write.bo);
-      vdenc_buf.Additional4XDSFWDREF.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-#endif
-   }
-}
-
-static const struct VkVideoEncodeH264PictureInfoKHR *
-anv_h264_frame_info(const VkVideoEncodeInfoKHR *enc_info)
-{
-   return vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
-}
-
-static const StdVideoH264SequenceParameterSet *
-anv_h264_sps(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
-{
-   return vk_video_find_h264_enc_std_sps(
-            cmd->video.params,
-            anv_h264_frame_info(enc_info)->pStdPictureInfo->seq_parameter_set_id);
-}
-
-static const StdVideoH264PictureParameterSet *
-anv_h264_pps(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
-{
-   return vk_video_find_h264_enc_std_pps(
-            cmd->video.params,
-            anv_h264_frame_info(enc_info)->pStdPictureInfo->pic_parameter_set_id);
-}
-
-static void
-anv_h264_l0_slots(const VkVideoEncodeInfoKHR *enc_info, const uint8_t *dpb_idx,
-                  const VkVideoReferenceSlotInfoKHR **l0_slots)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info =
-      frame_info->pStdPictureInfo->pRefLists;
-   unsigned num_l0 = 0;
-
-   for (unsigned i = 0; ref_list_info && num_l0 < 2 &&
-        i < ref_list_info->num_ref_idx_l0_active_minus1 + 1u; i++) {
-      uint8_t slot = ref_list_info->RefPicList0[i];
-      if (slot == STD_VIDEO_H264_NO_REFERENCE_PICTURE)
-         continue;
-      l0_slots[num_l0++] = &enc_info->pReferenceSlots[dpb_idx[slot]];
-   }
-}
-
-static const VkVideoReferenceSlotInfoKHR *
-anv_h264_l1_slot(const VkVideoEncodeInfoKHR *enc_info, const uint8_t *dpb_idx)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info =
-      frame_info->pStdPictureInfo->pRefLists;
-
-   if (frame_info->pStdPictureInfo->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_B &&
-       ref_list_info &&
-       ref_list_info->RefPicList1[0] != STD_VIDEO_H264_NO_REFERENCE_PICTURE)
-      return &enc_info->pReferenceSlots[dpb_idx[ref_list_info->RefPicList1[0]]];
-
-   return NULL;
-}
-
-static bool
-anv_h264_colloc_rd_en(const VkVideoEncodeInfoKHR *enc_info, const uint8_t *dpb_idx)
-{
-   const VkVideoReferenceSlotInfoKHR *l1_slot = anv_h264_l1_slot(enc_info, dpb_idx);
-
-   /* TODO: Needs to read a dedicated all-intra colocated buffer when L1[0] is an I picture. */
-   return l1_slot && !anv_h264_ref_slot_is_intra(l1_slot);
-}
-
-static uint32_t
-anv_h264_slice_qp(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info, uint32_t slice_id)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
-
-   return anv_video_encode_quantizer(cmd->video.vid, nalu->constantQp,
-                                     pps->pic_init_qp_minus26 + 26);
-}
-
-static uint32_t
-anv_h264_frame_qp(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   uint32_t slice_qp = 0;
-
-   for (uint32_t slice_id = 0; slice_id < frame_info->naluSliceEntryCount; slice_id++)
-      slice_qp = anv_h264_slice_qp(cmd, enc_info, slice_id);
-
-   return slice_qp;
-}
-
-static void
-anv_h264_emit_startup(struct anv_cmd_buffer *cmd)
-{
-#if GFX_VER >= 12
-   anv_video_emit_force_wakeup(cmd, false);
-   anv_vdenc_emit_control_state(cmd);
-   anv_video_emit_mfx_wait(cmd, NULL);
-#endif
-}
-
-static void
-anv_h264_emit_mfx_pipe_mode_select(struct anv_cmd_buffer *cmd,
-                                   const VkVideoEncodeInfoKHR *enc_info)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   bool post_deblock_enable = anv_post_deblock_enable(pps, frame_info);
-
-   anv_batch_emit(&cmd->batch, GENX(MFX_PIPE_MODE_SELECT), pipe_mode) {
-      pipe_mode.StandardSelect = SS_AVC;
-      pipe_mode.CodecSelect = Encode;
-      pipe_mode.FrameStatisticsStreamOutEnable = true;
-      pipe_mode.ScaledSurfaceEnable = false;
-      pipe_mode.PreDeblockingOutputEnable = !post_deblock_enable;
-      pipe_mode.PostDeblockingOutputEnable = post_deblock_enable;
-      pipe_mode.StreamOutEnable = false;
-      pipe_mode.VDEncMode = VM_VDEncMode;
-      pipe_mode.DecoderShortFormatMode = LongFormatDriverInterface;
-   }
-}
-
-static void
-anv_h264_emit_mfx_surface_state(struct anv_cmd_buffer *cmd,
-                                const VkVideoEncodeInfoKHR *enc_info)
-{
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-   const struct anv_image *src_img = iv->image;
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv =
-      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-   const struct anv_image *base_ref_img = base_ref_iv->image;
-
-   for (uint32_t i = 0; i < 2; i++) {
-      anv_batch_emit(&cmd->batch, GENX(MFX_SURFACE_STATE), surface) {
-         const struct anv_image *img_ = i == 0 ? base_ref_img : src_img;
-
-         surface.Width = (i == 0 ? img_->vk.extent.width :
-                          enc_info->srcPictureResource.codedExtent.width) - 1;
-         surface.Height = (i == 0 ? img_->vk.extent.height :
-                           enc_info->srcPictureResource.codedExtent.height) - 1;
-         surface.SurfaceID = i == 0 ? MFX_ReferencePicture : MFX_SourceInputPicture;
-         surface.TileWalk = TW_YMAJOR;
-         surface.TiledSurface = img_->planes[0].primary_surface.isl.tiling != ISL_TILING_LINEAR;
-         surface.SurfacePitch = img_->planes[0].primary_surface.isl.row_pitch_B - 1;
-         surface.InterleaveChroma = true;
-         surface.SurfaceFormat = MFX_PLANAR_420_8;
-
-         surface.YOffsetforUCb = img_->planes[1].primary_surface.memory_range.offset /
-            img_->planes[0].primary_surface.isl.row_pitch_B;
-         surface.YOffsetforVCr = img_->planes[1].primary_surface.memory_range.offset /
-            img_->planes[0].primary_surface.isl.row_pitch_B;
-      }
-   }
-
-   struct anv_video_enc_ds_layout ds_layout =
-      anv_video_get_enc_ds_layout(base_ref_img->vk.extent.width,
-                                  base_ref_img->vk.extent.height);
-
-   anv_batch_emit(&cmd->batch, GENX(MFX_SURFACE_STATE), surface) {
-      surface.Width = ds_layout.w4 - 1;
-      surface.Height = ds_layout.h4 - 1;
-      surface.SurfaceID = MFX_ReconstructedScaledReferencePicture;
-      surface.TileWalk = TW_YMAJOR;
-      surface.TiledSurface = true;
-      surface.SurfacePitch = ds_layout.pitch4 - 1;
-      surface.InterleaveChroma = true;
-      surface.SurfaceFormat = MFX_PLANAR_420_8;
-      surface.YOffsetforUCb = ds_layout.h4;
-      surface.YOffsetforVCr = ds_layout.h4;
-   }
-}
-
-static void
-anv_h264_emit_mfx_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
-                                      const VkVideoEncodeInfoKHR *enc_info,
-                                      bool brc_enabled)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   struct anv_video_session *vid = cmd->video.vid;
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv =
-      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-   bool post_deblock_enable = anv_post_deblock_enable(pps, frame_info);
-
-   anv_batch_emit(&cmd->batch, GENX(MFX_PIPE_BUF_ADDR_STATE), buf) {
-      if (post_deblock_enable) {
-         buf.PostDeblockingDestinationAddress =
-            anv_image_dpb_address(base_ref_iv, base_ref_array_layer);
-      } else {
-         buf.PreDeblockingDestinationAddress =
-            anv_image_dpb_address(base_ref_iv, base_ref_array_layer);
-      }
-      buf.PreDeblockingDestinationAttributes =
-         ANV_VID_ATTR(cmd->device, buf.PreDeblockingDestinationAddress.bo);
-      buf.PostDeblockingDestinationAttributes =
-         ANV_VID_ATTR(cmd->device, buf.PostDeblockingDestinationAddress.bo);
-
-      buf.OriginalUncompressedPictureSourceAddress =
-         anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer);
-      buf.OriginalUncompressedPictureSourceAttributes =
-         ANV_VID_ATTR(cmd->device,
-                      buf.OriginalUncompressedPictureSourceAddress.bo);
-
-#if GFX_VER >= 12
-      /* BRC: the MFX frame statistics stream out into the PAK stats buffer the
-       * HuC BRC Update kernel reads(region 2). */
-      if (brc_enabled)
-         buf.StreamOutDataDestinationAddress =
-            ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_PAK_STATS);
-#endif
-      buf.StreamOutDataDestinationAttributes =
-         ANV_VID_ATTR(cmd->device, buf.StreamOutDataDestinationAddress.bo);
-
-      buf.IntraRowStoreScratchBufferAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_INTRA_ROW_STORE);
-      buf.IntraRowStoreScratchBufferAttributes =
-         ANV_VID_ATTR(cmd->device, buf.IntraRowStoreScratchBufferAddress.bo);
-
-      buf.DeblockingFilterRowStoreScratchAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_DEBLOCK_FILTER_ROW_STORE);
-      buf.DeblockingFilterRowStoreScratchAttributes =
-         ANV_VID_ATTR(cmd->device,
-                      buf.DeblockingFilterRowStoreScratchAddress.bo);
-
-      struct anv_bo *ref_bo = NULL;
-
-      for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
-         const struct anv_image_view *ref_iv =
-            anv_image_view_from_handle(enc_info->pReferenceSlots[i].pPictureResource->imageViewBinding);
-
-         buf.ReferencePictureAddress[i] =
-            anv_image_dpb_address(ref_iv, enc_info->pReferenceSlots[i].pPictureResource->baseArrayLayer);
-
-         if (i == 0)
-            ref_bo = ref_iv->image->bindings[0].address.bo;
-      }
-
-      buf.ReferencePictureAttributes = ANV_VID_ATTR(cmd->device, ref_bo);
-
-#if GFX_VER >= 12
-      /* BRC: the PAK writes the frame-level statistics the HuC BRC Update
-       * reads into the MB status buffer(region 2), so point it at the same
-       * PAK stats buffer.
-       */
-      if (brc_enabled)
-         buf.MBStatusBufferAddress =
-            ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_PAK_STATS);
-#endif
-      buf.MBStatusBufferAttributes =
-         ANV_VID_ATTR(cmd->device, buf.MBStatusBufferAddress.bo);
-
-      buf.MBILDBStreamOutBufferAttributes = ANV_VID_ATTR(cmd->device, NULL);
-      buf.SecondMBILDBStreamOutBufferAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-
-#if GFX_VERx10 < 125
-      buf.ScaledReferenceSurfaceAddress =
-         anv_image_ds_4x_address(base_ref_iv, base_ref_array_layer);
-#endif
-      buf.ScaledReferenceSurfaceAttributes =
-         ANV_VID_ATTR(cmd->device, buf.ScaledReferenceSurfaceAddress.bo);
-   }
-}
-
-static void
-anv_h264_emit_mfx_ind_obj_base_addr_state(struct anv_cmd_buffer *cmd,
-                                          const VkVideoEncodeInfoKHR *enc_info)
-{
-   ANV_FROM_HANDLE(anv_buffer, dst_buffer, enc_info->dstBuffer);
-
-   anv_batch_emit(&cmd->batch, GENX(MFX_IND_OBJ_BASE_ADDR_STATE), index_obj) {
-      index_obj.MFXIndirectBitstreamObjectAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      index_obj.MFXIndirectMVObjectAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      index_obj.MFDIndirectITCOEFFObjectAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      index_obj.MFDIndirectITDBLKObjectAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-
-      index_obj.MFCIndirectPAKBSEObjectAddress =
-         anv_address_add(dst_buffer->address, 0);
-
-      index_obj.MFCIndirectPAKBSEObjectAttributes =
-         ANV_VID_ATTR(cmd->device,
-                      index_obj.MFCIndirectPAKBSEObjectAddress.bo);
-   }
-}
-
-static void
-anv_h264_emit_mfx_bsp_buf_base_addr_state(struct anv_cmd_buffer *cmd,
-                                          const VkVideoEncodeInfoKHR *enc_info)
-{
-   struct anv_video_session *vid = cmd->video.vid;
-
-   anv_batch_emit(&cmd->batch, GENX(MFX_BSP_BUF_BASE_ADDR_STATE), bsp) {
-      bsp.BSDMPCRowStoreScratchBufferAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_BSD_MPC_ROW_SCRATCH);
-
-      bsp.BSDMPCRowStoreScratchBufferAttributes =
-         ANV_VID_ATTR(cmd->device, bsp.BSDMPCRowStoreScratchBufferAddress.bo);
-
-      bsp.MPRRowStoreScratchBufferAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-
-      bsp.BitplaneReadBufferAttributes = ANV_VID_ATTR(cmd->device, NULL);
-   }
-}
-
-static void
-anv_h264_emit_vdenc_pipe_mode_select(struct anv_cmd_buffer *cmd,
-                                     const VkVideoEncodeInfoKHR *enc_info,
-                                     bool brc_enabled)
-{
-   anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_MODE_SELECT), vdenc_pipe_mode) {
-      vdenc_pipe_mode.StandardSelect = SS_AVC;
-      vdenc_pipe_mode.PAKChromaSubSamplingType = _420;
-#if GFX_VER >= 12
-      vdenc_pipe_mode.SourceLumaPackedDataTLBPrefetchEnable = true;
-      vdenc_pipe_mode.SourceChromaTLBPrefetchEnable = true;
-      vdenc_pipe_mode.HzShift32Minus1Src = 3;
-      vdenc_pipe_mode.PrefetchOffsetforSource = 4;
-      /* BRC: emit the VDENC per-frame statistics into region 1 so the HuC BRC
-       * Update kernel can drive the distortion-based QP adjustment. */
-      if (brc_enabled)
-         vdenc_pipe_mode.FrameStatisticsStreamOutEnable = true;
-#endif
-   }
-}
-
-static void
-anv_h264_emit_vdenc_src_surface_state(struct anv_cmd_buffer *cmd,
-                                      const VkVideoEncodeInfoKHR *enc_info)
-{
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-   const struct anv_image *src_img = iv->image;
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_SRC_SURFACE_STATE), vdenc_surface) {
-      vdenc_surface.SurfaceState =
-         anv_vdenc_surface_state(src_img, enc_info->srcPictureResource.codedExtent.width,
-                                 enc_info->srcPictureResource.codedExtent.height, false);
-      vdenc_surface.SurfaceState.Colorspaceselection = 1;
-   }
-}
-
-static void
-anv_h264_emit_vdenc_ref_surface_state(struct anv_cmd_buffer *cmd,
-                                      const VkVideoEncodeInfoKHR *enc_info)
-{
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv =
-      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-   const struct anv_image *base_ref_img = base_ref_iv->image;
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_REF_SURFACE_STATE), vdenc_surface) {
-      vdenc_surface.SurfaceState =
-         anv_vdenc_surface_state(base_ref_img, base_ref_img->vk.extent.width,
-                                 base_ref_img->vk.extent.height, false);
-   }
-}
-
-static void
-anv_h264_emit_vdenc_ds_ref_surface_state(struct anv_cmd_buffer *cmd,
-                                         const VkVideoEncodeInfoKHR *enc_info)
-{
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv = anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-   const struct anv_image *base_ref_img = base_ref_iv->image;
-
-   anv_vdenc_emit_ds_ref_surface_state(cmd,
-      anv_video_get_enc_ds_layout(base_ref_img->vk.extent.width,
-                                  base_ref_img->vk.extent.height), false);
-}
-
-static void
-anv_h264_emit_vdenc_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
-                                        const VkVideoEncodeInfoKHR *enc_info,
-                                        const uint8_t *dpb_idx,
-                                        bool brc_enabled)
-{
-   struct anv_video_session *vid = cmd->video.vid;
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-#if GFX_VERx10 >= 125
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv =
-      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-#endif
-
-   struct anv_vdenc_pipe_buf buf = {
-      .src = anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer),
-      .row_store = ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_MPR_ROW_SCRATCH),
-   };
-#if GFX_VER >= 12
-   if (brc_enabled)
-      buf.stats = ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_VDENC_STATS);
-#endif
-
-   const VkVideoReferenceSlotInfoKHR *l0_slots[2] = { NULL, NULL };
-   anv_h264_l0_slots(enc_info, dpb_idx, l0_slots);
-
-   if (l0_slots[0]) {
-      const struct anv_image_view *l0_iv =
-         anv_image_view_from_handle(l0_slots[0]->pPictureResource->imageViewBinding);
-      buf.fwd_ref[0] =
-            anv_image_dpb_address(l0_iv, l0_slots[0]->pPictureResource->baseArrayLayer);
-      buf.ds_fwd_ref[0] =
-            anv_image_ds_4x_address(l0_iv, l0_slots[0]->pPictureResource->baseArrayLayer);
-   }
-   if (l0_slots[1]) {
-      const struct anv_image_view *l0_iv =
-         anv_image_view_from_handle(l0_slots[1]->pPictureResource->imageViewBinding);
-      buf.fwd_ref[1] =
-            anv_image_dpb_address(l0_iv, l0_slots[1]->pPictureResource->baseArrayLayer);
-      buf.ds_fwd_ref[1] =
-            anv_image_ds_4x_address(l0_iv, l0_slots[1]->pPictureResource->baseArrayLayer);
-   }
-
-   const VkVideoReferenceSlotInfoKHR *l1_slot = anv_h264_l1_slot(enc_info, dpb_idx);
-   bool colloc_rd_en = anv_h264_colloc_rd_en(enc_info, dpb_idx);
-
-   if (l1_slot) {
-      const struct anv_image_view *l1_iv =
-         anv_image_view_from_handle(l1_slot->pPictureResource->imageViewBinding);
-      buf.bwd_ref =
-            anv_image_dpb_address(l1_iv, l1_slot->pPictureResource->baseArrayLayer);
-      if (colloc_rd_en)
-         buf.col_mv_read =
-               anv_image_dmv_top_address(l1_iv, l1_slot->pPictureResource->baseArrayLayer);
-#if GFX_VERx10 >= 125
-      buf.ds_bwd_ref =
-            anv_image_ds_4x_address(l1_iv, l1_slot->pPictureResource->baseArrayLayer);
-#endif
-   }
-
-#if GFX_VERx10 >= 125
-   if (enc_info->pSetupReferenceSlot)
-      buf.col_mv_avc_write =
-         anv_image_dmv_top_address(base_ref_iv, base_ref_array_layer);
-
-   buf.scaled_8x = anv_image_ds_4x_address(base_ref_iv, base_ref_array_layer);
-#endif
-
-   anv_vdenc_emit_pipe_buf_addr_state(cmd, &buf);
-}
-
-#if GFX_VERx10 < 125
-static void
-anv_h264_emit_vdenc_const_qpt_state(struct anv_cmd_buffer *cmd,
-                                    const VkVideoEncodeInfoKHR *enc_info)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   StdVideoH264PictureType pic_type = frame_info->pStdPictureInfo->primary_pic_type;
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_CONST_QPT_STATE), qpt) {
-      if (pic_type == STD_VIDEO_H264_PICTURE_TYPE_IDR || pic_type == STD_VIDEO_H264_PICTURE_TYPE_I) {
-         for (uint32_t i = 0; i < 42; i++) {
-            qpt.QPLambdaArrayIndex[i] = vdenc_const_qp_lambda[i];
-         }
-      } else {
-         for (uint32_t i = 0; i < 42; i++) {
-            qpt.QPLambdaArrayIndex[i] = vdenc_const_qp_lambda_p[i];
-         }
-
-         for (uint32_t i = 0; i < 27; i++) {
-            qpt.SkipThresholdArrayIndex[i] = vdenc_const_skip_threshold_p[i];
-            qpt.SICForwardTransformCoeffThresholdMatrix0ArrayIndex[i] =
-               vdenc_const_sic_forward_transform_coeff_threshold_0_p[i];
-            qpt.SICForwardTransformCoeffThresholdMatrix135ArrayIndex[i] =
-               vdenc_const_sic_forward_transform_coeff_threshold_1_p[i];
-            qpt.SICForwardTransformCoeffThresholdMatrix2ArrayIndex[i] =
-               vdenc_const_sic_forward_transform_coeff_threshold_2_p[i];
-            qpt.SICForwardTransformCoeffThresholdMatrix46ArrayIndex[i] =
-               vdenc_const_sic_forward_transform_coeff_threshold_3_p[i];
-         }
-
-         if (!pps->flags.transform_8x8_mode_flag) {
-            for (uint32_t i = 0; i < 27; i++) {
-               qpt.SkipThresholdArrayIndex[i] /= 2;
-            }
-         }
-      }
-   }
-}
-#endif
-
 static void
 anv_h264_emit_mfx_avc_img_state(struct anv_cmd_buffer *cmd,
                                 struct anv_batch *batch,
                                 const VkVideoEncodeInfoKHR *enc_info,
-                                bool brc_enabled)
+                                bool brc)
 {
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264SequenceParameterSet *sps = anv_h264_sps(cmd, enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   StdVideoH264PictureType pic_type = frame_info->pStdPictureInfo->primary_pic_type;
+   const struct VkVideoEncodeH264PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
+   struct vk_video_session_parameters *params = cmd->video.params;
+   const StdVideoH264SequenceParameterSet *sps =
+      vk_video_find_h264_enc_std_sps(params, frame_info->pStdPictureInfo->seq_parameter_set_id);
+   const StdVideoH264PictureParameterSet *pps =
+      vk_video_find_h264_enc_std_pps(params, frame_info->pStdPictureInfo->pic_parameter_set_id);
+   const StdVideoH264PictureType pic_type = frame_info->pStdPictureInfo->primary_pic_type;
 
-   if (!batch)
+   if (batch == NULL)
       batch = &cmd->batch;
 
    anv_batch_emit(batch, GENX(MFX_AVC_IMG_STATE), avc_img) {
@@ -979,10 +456,7 @@ anv_h264_emit_mfx_avc_img_state(struct anv_cmd_buffer *cmd,
 
       avc_img.WeightedBiPredictionIDC = pps->weighted_bipred_idc;
       avc_img.WeightedPredictionEnable = pps->flags.weighted_pred_flag;
-      avc_img.RhoDomainRateControlEnable = brc_enabled;
-#if GFX_VER >= 11
-      avc_img.ExtendedRhoDomainStatisticsEnable = brc_enabled;
-#endif
+      avc_img.RhoDomainRateControlEnable = false;
       avc_img.FirstChromaQPOffset = pps->chroma_qp_index_offset;
       avc_img.SecondChromaQPOffset = pps->second_chroma_qp_index_offset;
 
@@ -1036,162 +510,231 @@ anv_h264_emit_vdenc_cmd3(struct anv_cmd_buffer *cmd,
                          struct anv_batch *batch,
                          const VkVideoEncodeInfoKHR *enc_info)
 {
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info = frame_info->pStdPictureInfo->pRefLists;
-   StdVideoH264PictureType pic_type = frame_info->pStdPictureInfo->primary_pic_type;
-   uint32_t slice_qp = anv_h264_frame_qp(cmd, enc_info);
+   const struct VkVideoEncodeH264PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
+   struct vk_video_session_parameters *params = cmd->video.params;
+   const StdVideoH264SequenceParameterSet *sps =
+      vk_video_find_h264_enc_std_sps(params,
+         frame_info->pStdPictureInfo->seq_parameter_set_id);
+   const StdVideoH264PictureParameterSet *pps =
+      vk_video_find_h264_enc_std_pps(params,
+         frame_info->pStdPictureInfo->pic_parameter_set_id);
+   const StdVideoH264PictureType pic_type =
+      frame_info->pStdPictureInfo->primary_pic_type;
+   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info =
+      frame_info->pStdPictureInfo->pRefLists;
+   const bool rc_disable =
+      cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
 
-   if (!batch)
+   if (batch == NULL)
       batch = &cmd->batch;
 
-   /* The h264_vdenc_cmd3_table is taken from media-driver.
-    *
-    * TODO: a P-frame in a B GOP uses type 1 instead of 2, which needs the GOP's B-frame count
-    * (VkVideoEncodeH264RateControlInfoKHR::consecutiveBFrameCount); not plumbed through yet.
-    */
-   uint32_t cmd3_qp = CLAMP(slice_qp, 10, 51);
-   uint8_t cmd3_type;
-   if (pic_type == STD_VIDEO_H264_PICTURE_TYPE_B)
-      cmd3_type = enc_info->pSetupReferenceSlot ? 4 : 3;
-   else if (pic_type == STD_VIDEO_H264_PICTURE_TYPE_P)
-      cmd3_type = 2;
-   else
-      cmd3_type = 0;
-   anv_batch_emit(batch, GENX(VDENC_CMD3), cmd3) {
-      for (unsigned i = 0; i < 22; i++)
-         cmd3.Values[i] = h264_vdenc_cmd3_table[cmd3_type][cmd3_qp][i];
+   uint32_t slice_qp = 0;
+      for (uint32_t slice_id = 0; slice_id < frame_info->naluSliceEntryCount; slice_id++) {
+         const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
+         slice_qp = rc_disable ? nalu->constantQp : pps->pic_init_qp_minus26 + 26;
+      }
 
-      if (cmd3_type == 0 &&
-          (!ref_list_info || ref_list_info->num_ref_idx_l0_active_minus1 == 0))
-         cmd3.Values[12] &= 0xf0ff;
-   }
+      /* The h264_vdenc_cmd3_table is taken from media-driver.
+       *
+       * TODO: a P-frame in a B GOP uses type 1 instead of 2, which needs the GOP's B-frame count
+       * (VkVideoEncodeH264RateControlInfoKHR::consecutiveBFrameCount); not plumbed through yet.
+       */
+      uint32_t cmd3_qp = CLAMP(slice_qp, 10, 51);
+      uint8_t cmd3_type;
+      if (pic_type == STD_VIDEO_H264_PICTURE_TYPE_B)
+         cmd3_type = enc_info->pSetupReferenceSlot ? 4 : 3;
+      else if (pic_type == STD_VIDEO_H264_PICTURE_TYPE_P)
+         cmd3_type = 2;
+      else
+         cmd3_type = 0;
+      anv_batch_emit(batch, GENX(VDENC_CMD3), cmd3) {
+         for (unsigned i = 0; i < 22; i++)
+            cmd3.Values[i] = h264_vdenc_cmd3_table[cmd3_type][cmd3_qp][i];
+
+         if (cmd3_type == 0 &&
+             (!ref_list_info || ref_list_info->num_ref_idx_l0_active_minus1 == 0))
+            cmd3.Values[12] &= 0xf0ff;
+      }
+
 }
-#endif
 
-#if GFX_VERx10 >= 125
 static void
 anv_h264_emit_vdenc_avc_img_state(struct anv_cmd_buffer *cmd,
-                                  struct anv_batch *batch,
-                                  const VkVideoEncodeInfoKHR *enc_info,
-                                  const uint8_t *dpb_idx)
+                                    struct anv_batch *batch,
+                                    const VkVideoEncodeInfoKHR *enc_info,
+                                    const uint8_t *dpb_idx)
 {
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264SequenceParameterSet *sps = anv_h264_sps(cmd, enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info = frame_info->pStdPictureInfo->pRefLists;
-   StdVideoH264PictureType pic_type = frame_info->pStdPictureInfo->primary_pic_type;
-   uint32_t slice_qp = anv_h264_frame_qp(cmd, enc_info);
-   bool colloc_rd_en = anv_h264_colloc_rd_en(enc_info, dpb_idx);
+   const struct VkVideoEncodeH264PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
+   struct vk_video_session_parameters *params = cmd->video.params;
+   const StdVideoH264SequenceParameterSet *sps =
+      vk_video_find_h264_enc_std_sps(params,
+         frame_info->pStdPictureInfo->seq_parameter_set_id);
+   const StdVideoH264PictureParameterSet *pps =
+      vk_video_find_h264_enc_std_pps(params,
+         frame_info->pStdPictureInfo->pic_parameter_set_id);
+   const StdVideoH264PictureType pic_type =
+      frame_info->pStdPictureInfo->primary_pic_type;
+   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info =
+      frame_info->pStdPictureInfo->pRefLists;
+   const bool rc_disable =
+      cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
 
-   bool is_bframe = pic_type == STD_VIDEO_H264_PICTURE_TYPE_B;
-   bool is_inter = is_bframe || pic_type == STD_VIDEO_H264_PICTURE_TYPE_P;
-
-   if (!batch)
+   if (batch == NULL)
       batch = &cmd->batch;
 
-   struct GENX(VDENC_AVC_IMG_STATE) img = {
-      GENX(VDENC_AVC_IMG_STATE_header),
-      .PictureType              = anv_vdenc_h264_picture_type(pic_type),
-      .Transform8x8Flag         = pps->flags.transform_8x8_mode_flag,
-      .SubpelMode               = 3,
-      .PictureWidth             = sps->pic_width_in_mbs_minus1 + 1,
-      .PictureHeightMinusOne    = sps->pic_height_in_map_units_minus1,
-      .MinQp                    = 0x0a,
-      .MaxQp                    = 0x33,
-      .QpPrimeY                 = slice_qp,
-      .POCNumberForCurrentPicture = frame_info->pStdPictureInfo->PicOrderCnt & 0xff,
-   };
-
-   if (is_inter) {
-      /* Collocated MV write only when this frame is kept as a reference; collocated MV read
-       * and the bidirectional weight are B-frame only. */
-      img.CollocMVWREn = enc_info->pSetupReferenceSlot != NULL;
-
-      uint32_t num_l0_minus1 =
-         ref_list_info ? ref_list_info->num_ref_idx_l0_active_minus1 : 0;
-      img.NumberOfL0ReferencesMinusOne = num_l0_minus1;
-
-      /* Forward (L0) reference picture ids and their POCs; unused entries are 0xf. */
-      uint8_t fwd_ref_idx[3] = { 0xf, 0xf, 0xf };
-      int32_t fwd_ref_poc[3] = { 0, 0, 0 };
-      for (unsigned i = 0; ref_list_info && i <= num_l0_minus1 && i < 3; i++) {
-         uint8_t slot = ref_list_info->RefPicList0[i];
-         if (slot == STD_VIDEO_H264_NO_REFERENCE_PICTURE)
-            continue;
-         fwd_ref_idx[i] = dpb_idx[slot] & 0xf;
-         fwd_ref_poc[i] = anv_h264_dpb_slot_poc(enc_info, slot);
-      }
-      img.FwdRefIdx0ReferencePicture = fwd_ref_idx[0];
-      img.FwdRefIdx1ReferencePicture = fwd_ref_idx[1];
-      img.FwdRefIdx2ReferencePicture = fwd_ref_idx[2];
-      img.POCNumberForFwdRef0 = fwd_ref_poc[0] & 0xff;
-      img.POCNumberForFwdRef1 = fwd_ref_poc[1] & 0xff;
-      img.POCNumberForFwdRef2 = fwd_ref_poc[2] & 0xff;
-
-      if (is_bframe && ref_list_info) {
-         uint8_t slot = ref_list_info->RefPicList1[0];
-         img.CollocMVRDEn = colloc_rd_en;
-         img.BidirectionalWeight = 0x20;
-         img.NumberOfL1ReferencesMinusOne = ref_list_info->num_ref_idx_l1_active_minus1;
-         if (slot != STD_VIDEO_H264_NO_REFERENCE_PICTURE) {
-            img.BwdRefIdx0ReferencePicture = dpb_idx[slot] & 0xf;
-            img.POCNumberForBwdRef0 = anv_h264_dpb_slot_poc(enc_info, slot) & 0xff;
-         }
-      }
+   uint32_t slice_qp = 0;
+   for (uint32_t slice_id = 0; slice_id < frame_info->naluSliceEntryCount; slice_id++) {
+      const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
+      slice_qp = rc_disable ? nalu->constantQp : pps->pic_init_qp_minus26 + 26;
    }
 
-   /* h264_vdenc_avc_img_state[targetUsage - 1][type][...];
-    * TargetUsage is fixed to 4 (Normal/Balanced; 1 = Quality, 7 = Speed).
-    * type 0 = I, 1 = P, 2 = B non-ref, 3 = B ref.
-    *
-    * TODO: the rest, intra-refresh / A-stepping / Wa_18011246551 / stream-in
-    * are all 0 for now.
-    */
-   uint32_t level = vk_video_get_h264_level(sps->level_idc);
+      bool is_bframe = pic_type == STD_VIDEO_H264_PICTURE_TYPE_B;
+      bool is_inter = is_bframe || pic_type == STD_VIDEO_H264_PICTURE_TYPE_P;
+
+      struct GENX(VDENC_AVC_IMG_STATE) img = {
+         GENX(VDENC_AVC_IMG_STATE_header),
+         .PictureType              = anv_vdenc_h264_picture_type(pic_type),
+         .Transform8x8Flag         = pps->flags.transform_8x8_mode_flag,
+         .SubpelMode               = 3,
+         .PictureWidth             = sps->pic_width_in_mbs_minus1 + 1,
+         .PictureHeightMinusOne    = sps->pic_height_in_map_units_minus1,
+         .MinQp                    = 0x0a,
+         .MaxQp                    = 0x33,
+         .QpPrimeY                 = slice_qp,
+         .POCNumberForCurrentPicture = frame_info->pStdPictureInfo->PicOrderCnt & 0xff,
+      };
+
+      if (is_inter) {
+         /* Collocated MV write only when this frame is kept as a reference; collocated MV read
+          * and the bidirectional weight are B-frame only. */
+         img.CollocMVWREn = enc_info->pSetupReferenceSlot != NULL;
+
+         uint32_t num_l0_minus1 =
+            ref_list_info ? ref_list_info->num_ref_idx_l0_active_minus1 : 0;
+         img.NumberOfL0ReferencesMinusOne = num_l0_minus1;
+
+         /* Forward (L0) reference picture ids and their POCs; unused entries are 0xf. */
+         uint8_t fwd_ref_idx[3] = { 0xf, 0xf, 0xf };
+         int32_t fwd_ref_poc[3] = { 0, 0, 0 };
+         for (unsigned i = 0; ref_list_info && i <= num_l0_minus1 && i < 3; i++) {
+            uint8_t slot = ref_list_info->RefPicList0[i];
+            if (slot == STD_VIDEO_H264_NO_REFERENCE_PICTURE)
+               continue;
+            fwd_ref_idx[i] = dpb_idx[slot] & 0xf;
+            fwd_ref_poc[i] = anv_h264_dpb_slot_poc(enc_info, slot);
+         }
+         img.FwdRefIdx0ReferencePicture = fwd_ref_idx[0];
+         img.FwdRefIdx1ReferencePicture = fwd_ref_idx[1];
+         img.FwdRefIdx2ReferencePicture = fwd_ref_idx[2];
+         img.POCNumberForFwdRef0 = fwd_ref_poc[0] & 0xff;
+         img.POCNumberForFwdRef1 = fwd_ref_poc[1] & 0xff;
+         img.POCNumberForFwdRef2 = fwd_ref_poc[2] & 0xff;
+
+         if (is_bframe && ref_list_info) {
+            uint8_t slot = ref_list_info->RefPicList1[0];
+            img.CollocMVRDEn = true;
+            img.BidirectionalWeight = 0x20;
+            img.NumberOfL1ReferencesMinusOne = ref_list_info->num_ref_idx_l1_active_minus1;
+            if (slot != STD_VIDEO_H264_NO_REFERENCE_PICTURE) {
+               img.BwdRefIdx0ReferencePicture = dpb_idx[slot] & 0xf;
+               img.POCNumberForBwdRef0 = anv_h264_dpb_slot_poc(enc_info, slot) & 0xff;
+            }
+         }
+      }
+
+      /* TargetUsage is fixed to 4 (Normal/Balanced; 1 = Quality, 7 = Speed).
+       *
+       * TODO: the rest, intra-refresh / A-stepping / Wa_18011246551 / stream-in
+       * are all 0 for now.
+       */
+      uint32_t level = vk_video_get_h264_level(sps->level_idc);
 
 #if GFX_VER >= 20
-   /* Xe2 HPG (BMG) programs the full 26 dword command, with the tuning values
-    * from media-driver's Xe2_HPM AVC const settings.  Target usage 4
-    * (Normal/Balanced), slice level rate control and low delay mode off, and
-    * the current picture is a reference when a setup slot is given.
-    */
-   const uint32_t tu = 4;
-   const uint32_t ref_pic_flag = enc_info->pSetupReferenceSlot != NULL;
-   const uint32_t type_idx = !is_inter ? 0 : !is_bframe ? 1 : 2;
+      /* Xe2 HPG (BMG) programs the full 26 dword command, with the tuning
+       * values taken from media-driver's Xe2_HPM AVC const settings
+       * (encode_avc_vdenc_const_settings_xe2_hpm_open.h). Slice level rate
+       * control and low delay mode are off, the current picture is a
+       * reference when a setup slot is given.
+       */
+      const uint32_t tu = 4;
+      const uint32_t ref_pic_flag = enc_info->pSetupReferenceSlot != NULL;
+      const uint32_t type_idx = !is_inter ? 0 : !is_bframe ? 1 : 2;
 
-   uint32_t *dw = anv_batch_emitn(batch, GENX(VDENC_AVC_IMG_STATE_length),
-                                  GENX(VDENC_AVC_IMG_STATE));
-   GENX(VDENC_AVC_IMG_STATE_pack)(batch, dw, &img);
+      uint32_t *dw = anv_batch_emitn(batch, GENX(VDENC_AVC_IMG_STATE_length),
+                                     GENX(VDENC_AVC_IMG_STATE));
+      GENX(VDENC_AVC_IMG_STATE_pack)(batch, dw, &img);
 
-   dw[1]  |= xe2_h264_vdenc_avc_img_state_dw1;
-   dw[2]  |= xe2_h264_vdenc_avc_img_state_dw2[type_idx][tu][ref_pic_flag][0];
-   dw[5]  |= xe2_h264_vdenc_avc_img_state_dw5[type_idx][tu];
-   dw[7]  |= xe2_h264_vdenc_avc_img_state_dw7;
-   dw[8]  |= level <= 52 ? xe2_h264_vdenc_avc_img_state_dw8[level] : 0x02002000;
-   dw[10] |= xe2_h264_vdenc_avc_img_state_dw10[type_idx];
-   dw[11] |= xe2_h264_vdenc_avc_img_state_dw11[type_idx];
-   dw[12] |= xe2_h264_vdenc_avc_img_state_dw12[type_idx][tu];
-   dw[13] |= xe2_h264_vdenc_avc_img_state_dw13[type_idx][tu][0];
-   dw[14] |= xe2_h264_vdenc_avc_img_state_dw14[type_idx][tu];
-   dw[15] |= xe2_h264_vdenc_avc_img_state_dw15;
-   dw[16] |= xe2_h264_vdenc_avc_img_state_dw16;
-   dw[17] |= xe2_h264_vdenc_avc_img_state_dw17;
-   dw[18] |= xe2_h264_vdenc_avc_img_state_dw18;
-   dw[19] |= xe2_h264_vdenc_avc_img_state_dw19;
-   dw[22] |= xe2_h264_vdenc_avc_img_state_dw22;
-   dw[25] |= xe2_h264_vdenc_avc_img_state_dw25[tu];
+      dw[1]  |= xe2_h264_vdenc_avc_img_state_dw1;
+      dw[2]  |= xe2_h264_vdenc_avc_img_state_dw2[type_idx][tu][ref_pic_flag][0];
+      dw[5]  |= xe2_h264_vdenc_avc_img_state_dw5[type_idx][tu];
+      dw[7]  |= xe2_h264_vdenc_avc_img_state_dw7;
+      dw[8]  |= level <= 52 ? xe2_h264_vdenc_avc_img_state_dw8[level] : 0x02002000;
+      dw[10] |= xe2_h264_vdenc_avc_img_state_dw10[type_idx];
+      dw[11] |= xe2_h264_vdenc_avc_img_state_dw11[type_idx];
+      dw[12] |= xe2_h264_vdenc_avc_img_state_dw12[type_idx][tu];
+      dw[13] |= xe2_h264_vdenc_avc_img_state_dw13[type_idx][tu][0];
+      dw[14] |= xe2_h264_vdenc_avc_img_state_dw14[type_idx][tu];
+      dw[15] |= xe2_h264_vdenc_avc_img_state_dw15;
+      dw[16] |= xe2_h264_vdenc_avc_img_state_dw16;
+      dw[17] |= xe2_h264_vdenc_avc_img_state_dw17;
+      dw[18] |= xe2_h264_vdenc_avc_img_state_dw18;
+      dw[19] |= xe2_h264_vdenc_avc_img_state_dw19;
+      dw[22] |= xe2_h264_vdenc_avc_img_state_dw22;
+      dw[25] |= xe2_h264_vdenc_avc_img_state_dw25[tu];
+
+      /* VK_KHR_video_encode_intra_refresh: rolling intra refresh, one band of
+       * macroblock rows or columns per picture (gen120 VDENC_AVC_IMG_STATE
+       * dword 6: position, size minus one, enable and mode).
+       */
+      const VkVideoEncodeIntraRefreshInfoKHR *intra_refresh =
+         (enc_info->flags & VK_VIDEO_ENCODE_INTRA_REFRESH_BIT_KHR) ?
+         vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_INTRA_REFRESH_INFO_KHR) :
+         NULL;
+      const bool rolling_intra_refresh =
+         cmd->video.vid->intra_refresh_mode ==
+            VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_BLOCK_ROW_BASED_BIT_KHR ||
+         cmd->video.vid->intra_refresh_mode ==
+            VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_BLOCK_COLUMN_BASED_BIT_KHR;
+      if (rolling_intra_refresh &&
+          intra_refresh != NULL &&
+          intra_refresh->intraRefreshCycleDuration > 0 &&
+          is_inter) {
+         const bool column_mode =
+            cmd->video.vid->intra_refresh_mode ==
+            VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_BLOCK_COLUMN_BASED_BIT_KHR;
+         const uint32_t limit = DIV_ROUND_UP(column_mode ?
+            enc_info->srcPictureResource.codedExtent.width :
+            enc_info->srcPictureResource.codedExtent.height, 16);
+         uint32_t band = DIV_ROUND_UP(limit, intra_refresh->intraRefreshCycleDuration);
+         uint32_t pos = intra_refresh->intraRefreshIndex * band;
+
+         if (band == 0)
+            band = 1;
+         if (band > limit)
+            band = limit;
+         if (pos + band > limit)
+            pos = limit > band ? limit - band : 0;
+
+         dw[6] = (dw[6] & 0x00ff0000) |
+                 pos | ((band - 1) << 8) | (1u << 16) | ((uint32_t)column_mode << 17);
+      }
 #else
-   uint8_t img_type = !is_inter ? 0 : !is_bframe ? 1 :
-                      (enc_info->pSetupReferenceSlot ? 3 : 2);
-   const uint32_t *cost = h264_vdenc_avc_img_state[4 - 1][img_type][0][0][0][0];
+      /* h264_vdenc_avc_img_state[targetUsage - 1][type][...];
+       * type 0 = I, 1 = P, 2 = B non-ref, 3 = B ref.
+       */
+      uint8_t img_type = !is_inter ? 0 : !is_bframe ? 1 :
+                         (enc_info->pSetupReferenceSlot ? 3 : 2);
+      const uint32_t *cost = h264_vdenc_avc_img_state[4 - 1][img_type][0][0][0][0];
 
-   uint32_t *dw = anv_batch_emitn(batch, 20, GENX(VDENC_AVC_IMG_STATE));
-   GENX(VDENC_AVC_IMG_STATE_pack)(batch, dw, &img);
-   for (unsigned i = 0; i < 19; i++)
-      dw[i + 1] |= cost[i];
+      uint32_t *dw = anv_batch_emitn(batch, 20, GENX(VDENC_AVC_IMG_STATE));
+      GENX(VDENC_AVC_IMG_STATE_pack)(batch, dw, &img);
+      for (unsigned i = 0; i < 19; i++)
+         dw[i + 1] |= cost[i];
 
-   dw[8] = (dw[8] & 0xffff) |
-           (level <= 52 ? h264_vdenc_avc_img_state_dw8[level] : 0x02000000);
+      dw[8] = (dw[8] & 0xffff) |
+              (level <= 52 ? h264_vdenc_avc_img_state_dw8[level] : 0x02000000);
 #endif
 }
 #endif
@@ -1199,24 +742,38 @@ anv_h264_emit_vdenc_avc_img_state(struct anv_cmd_buffer *cmd,
 #if GFX_VERx10 < 125
 static void
 anv_h264_emit_vdenc_img_state(struct anv_cmd_buffer *cmd,
-                              struct anv_batch *batch,
-                              const VkVideoEncodeInfoKHR *enc_info)
+                               struct anv_batch *batch,
+                               const VkVideoEncodeInfoKHR *enc_info)
 {
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264SequenceParameterSet *sps = anv_h264_sps(cmd, enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info = frame_info->pStdPictureInfo->pRefLists;
-   StdVideoH264PictureType pic_type = frame_info->pStdPictureInfo->primary_pic_type;
+   const struct VkVideoEncodeH264PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
+   struct vk_video_session_parameters *params = cmd->video.params;
+   const StdVideoH264SequenceParameterSet *sps =
+      vk_video_find_h264_enc_std_sps(params,
+         frame_info->pStdPictureInfo->seq_parameter_set_id);
+   const StdVideoH264PictureParameterSet *pps =
+      vk_video_find_h264_enc_std_pps(params,
+         frame_info->pStdPictureInfo->pic_parameter_set_id);
+   const StdVideoH264PictureType pic_type =
+      frame_info->pStdPictureInfo->primary_pic_type;
+   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info =
+      frame_info->pStdPictureInfo->pRefLists;
+   const bool rc_disable =
+      cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+
+   if (batch == NULL)
+      batch = &cmd->batch;
 
    uint8_t     mode_cost[12];
    uint8_t     mv_cost[8];
    uint8_t     hme_mv_cost[8];
 
-   if (!batch)
-      batch = &cmd->batch;
-
    anv_batch_emit(batch, GENX(VDENC_IMG_STATE), vdenc_img) {
-      uint32_t slice_qp = anv_h264_frame_qp(cmd, enc_info);
+      uint32_t slice_qp = 0;
+      for (uint32_t slice_id = 0; slice_id < frame_info->naluSliceEntryCount; slice_id++) {
+         const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
+         slice_qp = rc_disable ? nalu->constantQp : pps->pic_init_qp_minus26 + 26;
+      }
 
       update_costs(mode_cost, mv_cost, hme_mv_cost, slice_qp, pic_type);
 
@@ -1322,11 +879,455 @@ anv_h264_emit_vdenc_img_state(struct anv_cmd_buffer *cmd,
 #endif
 
 static void
-anv_h264_emit_mfx_qm_state(struct anv_cmd_buffer *cmd,
-                           const VkVideoEncodeInfoKHR *enc_info)
+anv_h264_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
 {
-   const StdVideoH264SequenceParameterSet *sps = anv_h264_sps(cmd, enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
+   ANV_FROM_HANDLE(anv_buffer, dst_buffer, enc_info->dstBuffer);
+
+   struct anv_video_session *vid = cmd->video.vid;
+   struct vk_video_session_parameters *params = cmd->video.params;
+
+   const struct VkVideoEncodeH264PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
+
+   const StdVideoH264SequenceParameterSet *sps = vk_video_find_h264_enc_std_sps(params, frame_info->pStdPictureInfo->seq_parameter_set_id);
+   const StdVideoH264PictureParameterSet *pps = vk_video_find_h264_enc_std_pps(params, frame_info->pStdPictureInfo->pic_parameter_set_id);
+   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info = frame_info->pStdPictureInfo->pRefLists;
+
+   const struct anv_image_view *iv = anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
+   const struct anv_image *src_img = iv->image;
+   bool post_deblock_enable = anv_post_deblock_enable(pps, frame_info);
+   bool rc_disable = cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+#if GFX_VER >= 12
+   const bool brc_enabled =
+      (cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR ||
+       cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR) &&
+      getenv("ANV_H264_BRC_ENABLE");
+#else
+   const bool brc_enabled = false;
+#endif
+   uint8_t dpb_idx[ANV_VIDEO_H264_MAX_NUM_REF_FRAME] = { 0,};
+
+   const struct anv_image_view *base_ref_iv;
+   uint32_t base_ref_array_layer;
+   if (enc_info->pSetupReferenceSlot) {
+      base_ref_iv = anv_image_view_from_handle(enc_info->pSetupReferenceSlot->pPictureResource->imageViewBinding);
+      base_ref_array_layer = enc_info->pSetupReferenceSlot->pPictureResource->baseArrayLayer;
+   } else {
+      base_ref_iv = iv;
+      base_ref_array_layer = enc_info->srcPictureResource.baseArrayLayer;
+   }
+
+   const struct anv_image *base_ref_img = base_ref_iv->image;
+
+   anv_batch_emit(&cmd->batch, GENX(MI_FLUSH_DW), flush) {
+      flush.VideoPipelineCacheInvalidate = 1;
+   };
+
+#if GFX_VER >= 12
+   anv_batch_emit(&cmd->batch, GENX(MI_FORCE_WAKEUP), wake) {
+      wake.MFXPowerWellControl = 1;
+      wake.MaskBits = 768;
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_CONTROL_STATE), v) {
+      v.VdencInitialization = true;
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(MFX_WAIT), mfx) {
+      mfx.MFXSyncControlFlag = 1;
+   }
+#endif
+
+   anv_batch_emit(&cmd->batch, GENX(MFX_PIPE_MODE_SELECT), pipe_mode) {
+      pipe_mode.StandardSelect = SS_AVC;
+      pipe_mode.CodecSelect = Encode;
+      pipe_mode.FrameStatisticsStreamOutEnable = true;
+      pipe_mode.ScaledSurfaceEnable = false;
+      pipe_mode.PreDeblockingOutputEnable = !post_deblock_enable;
+      pipe_mode.PostDeblockingOutputEnable = post_deblock_enable;
+      pipe_mode.StreamOutEnable = false;
+      pipe_mode.VDEncMode = VM_VDEncMode;
+      pipe_mode.DecoderShortFormatMode = LongFormatDriverInterface;
+   }
+
+#if GFX_VER >= 12
+   anv_batch_emit(&cmd->batch, GENX(MFX_WAIT), mfx) {
+      mfx.MFXSyncControlFlag = 1;
+   }
+#endif
+
+   for (uint32_t i = 0; i < 2; i++) {
+      anv_batch_emit(&cmd->batch, GENX(MFX_SURFACE_STATE), surface) {
+         const struct anv_image *img_ = i == 0 ? base_ref_img : src_img;
+
+         surface.Width = (i == 0 ? img_->vk.extent.width :
+                          enc_info->srcPictureResource.codedExtent.width) - 1;
+         surface.Height = (i == 0 ? img_->vk.extent.height :
+                           enc_info->srcPictureResource.codedExtent.height) - 1;
+         /* TODO. add a surface for MFX_ReconstructedScaledReferencePicture */
+         surface.SurfaceID = i == 0 ? MFX_ReferencePicture : MFX_SourceInputPicture;
+         surface.TileWalk = TW_YMAJOR;
+         surface.TiledSurface = img_->planes[0].primary_surface.isl.tiling != ISL_TILING_LINEAR;
+         surface.SurfacePitch = img_->planes[0].primary_surface.isl.row_pitch_B - 1;
+         surface.InterleaveChroma = true;
+         surface.SurfaceFormat = MFX_PLANAR_420_8;
+
+         surface.YOffsetforUCb = img_->planes[1].primary_surface.memory_range.offset /
+            img_->planes[0].primary_surface.isl.row_pitch_B;
+         surface.YOffsetforVCr = img_->planes[1].primary_surface.memory_range.offset /
+            img_->planes[0].primary_surface.isl.row_pitch_B;
+      }
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(MFX_PIPE_BUF_ADDR_STATE), buf) {
+      if (post_deblock_enable) {
+         buf.PostDeblockingDestinationAddress =
+            anv_image_dpb_address(base_ref_iv, base_ref_array_layer);
+      } else {
+         buf.PreDeblockingDestinationAddress =
+            anv_image_dpb_address(base_ref_iv, base_ref_array_layer);
+      }
+      buf.PreDeblockingDestinationAttributes =
+         ANV_VID_ATTR(cmd->device, buf.PreDeblockingDestinationAddress.bo);
+      buf.PostDeblockingDestinationAttributes =
+         ANV_VID_ATTR(cmd->device, buf.PostDeblockingDestinationAddress.bo);
+
+      buf.OriginalUncompressedPictureSourceAddress =
+         anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer);
+      buf.OriginalUncompressedPictureSourceAttributes =
+         ANV_VID_ATTR(cmd->device,
+                      buf.OriginalUncompressedPictureSourceAddress.bo);
+
+      buf.StreamOutDataDestinationAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      buf.IntraRowStoreScratchBufferAddress =
+         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_INTRA_ROW_STORE);
+      buf.IntraRowStoreScratchBufferAttributes =
+         ANV_VID_ATTR(cmd->device, buf.IntraRowStoreScratchBufferAddress.bo);
+
+      buf.DeblockingFilterRowStoreScratchAddress =
+         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_DEBLOCK_FILTER_ROW_STORE);
+      buf.DeblockingFilterRowStoreScratchAttributes =
+         ANV_VID_ATTR(cmd->device,
+                      buf.DeblockingFilterRowStoreScratchAddress.bo);
+
+      struct anv_bo *ref_bo = NULL;
+
+      for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
+         const struct anv_image_view *ref_iv =
+            anv_image_view_from_handle(enc_info->pReferenceSlots[i].pPictureResource->imageViewBinding);
+         int slot_idx = enc_info->pReferenceSlots[i].slotIndex;
+         assert(slot_idx < ANV_VIDEO_H264_MAX_NUM_REF_FRAME);
+
+         dpb_idx[slot_idx] = i;
+
+         buf.ReferencePictureAddress[i] =
+            anv_image_dpb_address(ref_iv, enc_info->pReferenceSlots[i].pPictureResource->baseArrayLayer);
+
+         if (i == 0)
+            ref_bo = ref_iv->image->bindings[0].address.bo;
+      }
+
+      buf.ReferencePictureAttributes = ANV_VID_ATTR(cmd->device, ref_bo);
+
+      buf.MBStatusBufferAttributes = ANV_VID_ATTR(cmd->device, NULL);
+
+      buf.MBILDBStreamOutBufferAttributes = ANV_VID_ATTR(cmd->device, NULL);
+      buf.SecondMBILDBStreamOutBufferAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      /* TODO. Add for scaled reference surface */
+      buf.ScaledReferenceSurfaceAttributes =
+         ANV_VID_ATTR(cmd->device, buf.ScaledReferenceSurfaceAddress.bo);
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(MFX_IND_OBJ_BASE_ADDR_STATE), index_obj) {
+      index_obj.MFXIndirectBitstreamObjectAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      index_obj.MFXIndirectMVObjectAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      index_obj.MFDIndirectITCOEFFObjectAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      index_obj.MFDIndirectITDBLKObjectAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      index_obj.MFCIndirectPAKBSEObjectAddress = anv_address_add(dst_buffer->address, 0);
+
+      index_obj.MFCIndirectPAKBSEObjectAttributes =
+         ANV_VID_ATTR(cmd->device,
+                      index_obj.MFCIndirectPAKBSEObjectAddress.bo);
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(MFX_BSP_BUF_BASE_ADDR_STATE), bsp) {
+      bsp.BSDMPCRowStoreScratchBufferAddress =
+         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_BSD_MPC_ROW_SCRATCH);
+
+      bsp.BSDMPCRowStoreScratchBufferAttributes =
+         ANV_VID_ATTR(cmd->device, bsp.BSDMPCRowStoreScratchBufferAddress.bo);
+
+      bsp.MPRRowStoreScratchBufferAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      bsp.BitplaneReadBufferAttributes = ANV_VID_ATTR(cmd->device, NULL);
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_MODE_SELECT), vdenc_pipe_mode) {
+      vdenc_pipe_mode.StandardSelect = SS_AVC;
+      vdenc_pipe_mode.PAKChromaSubSamplingType = _420;
+#if GFX_VER >= 12
+      //vdenc_pipe_mode.HMERegionPrefetchEnable = !vdenc_pipe_mode.TLBPrefetchEnable;
+      vdenc_pipe_mode.SourceLumaPackedDataTLBPrefetchEnable = true;
+      vdenc_pipe_mode.SourceChromaTLBPrefetchEnable = true;
+      vdenc_pipe_mode.HzShift32Minus1Src = 3;
+      vdenc_pipe_mode.PrefetchOffsetforSource = 4;
+#endif
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_SRC_SURFACE_STATE), vdenc_surface) {
+      vdenc_surface.SurfaceState.Width = enc_info->srcPictureResource.codedExtent.width - 1;
+      vdenc_surface.SurfaceState.Height = enc_info->srcPictureResource.codedExtent.height - 1;
+      vdenc_surface.SurfaceState.SurfaceFormat = VDENC_PLANAR_420_8;
+      vdenc_surface.SurfaceState.SurfacePitch = src_img->planes[0].primary_surface.isl.row_pitch_B - 1;
+
+#if GFX_VER == 9
+      vdenc_surface.SurfaceState.InterleaveChroma = true;
+#endif
+
+      vdenc_surface.SurfaceState.TileWalk = TW_YMAJOR;
+      vdenc_surface.SurfaceState.TiledSurface = src_img->planes[0].primary_surface.isl.tiling != ISL_TILING_LINEAR;
+      vdenc_surface.SurfaceState.YOffsetforUCb = src_img->planes[1].primary_surface.memory_range.offset /
+         src_img->planes[0].primary_surface.isl.row_pitch_B;
+      vdenc_surface.SurfaceState.YOffsetforVCr = src_img->planes[1].primary_surface.memory_range.offset /
+         src_img->planes[0].primary_surface.isl.row_pitch_B;
+      vdenc_surface.SurfaceState.Colorspaceselection = 1;
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_REF_SURFACE_STATE), vdenc_surface) {
+      vdenc_surface.SurfaceState.Width = base_ref_img->vk.extent.width - 1;
+      vdenc_surface.SurfaceState.Height = base_ref_img->vk.extent.height - 1;
+      vdenc_surface.SurfaceState.SurfaceFormat = VDENC_PLANAR_420_8;
+#if GFX_VER == 9
+      vdenc_surface.SurfaceState.InterleaveChroma = true;
+#endif
+      vdenc_surface.SurfaceState.SurfacePitch = base_ref_img->planes[0].primary_surface.isl.row_pitch_B - 1;
+
+      vdenc_surface.SurfaceState.TileWalk = TW_YMAJOR;
+      vdenc_surface.SurfaceState.TiledSurface = base_ref_img->planes[0].primary_surface.isl.tiling != ISL_TILING_LINEAR;
+      vdenc_surface.SurfaceState.YOffsetforUCb = base_ref_img->planes[1].primary_surface.memory_range.offset /
+         base_ref_img->planes[0].primary_surface.isl.row_pitch_B;
+      vdenc_surface.SurfaceState.YOffsetforVCr = base_ref_img->planes[1].primary_surface.memory_range.offset /
+         base_ref_img->planes[0].primary_surface.isl.row_pitch_B;
+   }
+
+   /* TODO. add a cmd for VDENC_DS_REF_SURFACE_STATE */
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_BUF_ADDR_STATE), vdenc_buf) {
+      /* TODO. add DSFWDREF and FWDREF */
+      vdenc_buf.DSFWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+
+      vdenc_buf.DSFWDREF1.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#if GFX_VERx10 >= 125
+      vdenc_buf.DSBWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#endif
+
+      vdenc_buf.OriginalUncompressedPicture.Address =
+         anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer);
+      vdenc_buf.OriginalUncompressedPicture.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.OriginalUncompressedPicture.Address.bo, 0),
+      };
+
+      vdenc_buf.StreamInDataPicture.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+
+      vdenc_buf.RowStoreScratchBuffer.Address =
+         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H264_MPR_ROW_SCRATCH);
+
+      vdenc_buf.RowStoreScratchBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.RowStoreScratchBuffer.Address.bo, 0),
+      };
+
+      const VkVideoReferenceSlotInfoKHR *l0_slots[3] = { NULL, NULL, NULL };
+      unsigned num_l0 = 0;
+      for (unsigned i = 0; ref_list_info && num_l0 < ARRAY_SIZE(l0_slots) &&
+           i < ref_list_info->num_ref_idx_l0_active_minus1 + 1u; i++) {
+         uint8_t slot = ref_list_info->RefPicList0[i];
+         if (slot == STD_VIDEO_H264_NO_REFERENCE_PICTURE)
+            continue;
+         l0_slots[num_l0++] = &enc_info->pReferenceSlots[dpb_idx[slot]];
+      }
+
+      if (l0_slots[0]) {
+         const struct anv_image_view *l0_iv =
+            anv_image_view_from_handle(l0_slots[0]->pPictureResource->imageViewBinding);
+         vdenc_buf.ColocatedMVReadBuffer.Address =
+               anv_image_dmv_top_address(l0_iv, l0_slots[0]->pPictureResource->baseArrayLayer);
+         vdenc_buf.FWDREF0.Address =
+               anv_image_dpb_address(l0_iv, l0_slots[0]->pPictureResource->baseArrayLayer);
+      }
+
+      vdenc_buf.ColocatedMVReadBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.ColocatedMVReadBuffer.Address.bo, 0),
+      };
+
+      vdenc_buf.FWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.FWDREF0.Address.bo, 0),
+      };
+
+      if (l0_slots[1]) {
+         const struct anv_image_view *l1_iv =
+            anv_image_view_from_handle(l0_slots[1]->pPictureResource->imageViewBinding);
+         vdenc_buf.FWDREF1.Address =
+               anv_image_dpb_address(l1_iv, l0_slots[1]->pPictureResource->baseArrayLayer);
+      }
+
+      vdenc_buf.FWDREF1.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.FWDREF1.Address.bo, 0),
+      };
+
+      if (l0_slots[2]) {
+         const struct anv_image_view *l2_iv =
+            anv_image_view_from_handle(l0_slots[2]->pPictureResource->imageViewBinding);
+         vdenc_buf.FWDREF2.Address =
+            anv_image_dpb_address(l2_iv, l0_slots[2]->pPictureResource->baseArrayLayer);
+      }
+
+      vdenc_buf.FWDREF2.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.FWDREF2.Address.bo, 0),
+      };
+
+      /* B-frame backward (L1) reference recon surface. */
+      if (frame_info->pStdPictureInfo->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_B &&
+          ref_list_info) {
+         uint8_t bwd_slot = ref_list_info->RefPicList1[0];
+         for (unsigned j = 0; bwd_slot != STD_VIDEO_H264_NO_REFERENCE_PICTURE &&
+                              j < enc_info->referenceSlotCount; j++) {
+            if (enc_info->pReferenceSlots[j].slotIndex != (int32_t)bwd_slot)
+               continue;
+            const struct anv_image_view *bwd_iv = anv_image_view_from_handle(
+               enc_info->pReferenceSlots[j].pPictureResource->imageViewBinding);
+            vdenc_buf.BWDREF0.Address = anv_image_dpb_address(
+               bwd_iv, enc_info->pReferenceSlots[j].pPictureResource->baseArrayLayer);
+            break;
+         }
+      }
+      vdenc_buf.BWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.BWDREF0.Address.bo, 0),
+      };
+
+      vdenc_buf.VDEncStatisticsStreamOut.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+
+#if GFX_VER >= 11
+      vdenc_buf.DSFWDREF04X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.DSFWDREF14X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#if GFX_VERx10 < 125
+      vdenc_buf.VDEncCURecordStreamOutBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#else
+      vdenc_buf.DSBWDREF04X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#endif
+      vdenc_buf.VDEncLCUPAK_OBJ_CMDBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.ScaledReferenceSurface8X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.ScaledReferenceSurface4X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VP9SegmentationMapStreamInBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VP9SegmentationMapStreamOutBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#endif
+#if GFX_VER >= 12
+      vdenc_buf.VDEncTileRowStoreBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VDEncCumulativeCUCountStreamOutSurface.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VDEncPaletteModeStreamOutSurface.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#endif
+
+#if GFX_VERx10 >= 125
+      vdenc_buf.IntraPredictionRowStoreBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.ColocatedMVAVCWriteBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.Additional4XDSFWDREF.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#endif
+   }
+
+   StdVideoH264PictureType pic_type;
+
+   pic_type = frame_info->pStdPictureInfo->primary_pic_type;
+
+#if GFX_VERx10 < 125
+   anv_batch_emit(&cmd->batch, GENX(VDENC_CONST_QPT_STATE), qpt) {
+      if (pic_type == STD_VIDEO_H264_PICTURE_TYPE_IDR || pic_type == STD_VIDEO_H264_PICTURE_TYPE_I) {
+         for (uint32_t i = 0; i < 42; i++) {
+            qpt.QPLambdaArrayIndex[i] = vdenc_const_qp_lambda[i];
+         }
+      } else {
+         for (uint32_t i = 0; i < 42; i++) {
+            qpt.QPLambdaArrayIndex[i] = vdenc_const_qp_lambda_p[i];
+         }
+
+         for (uint32_t i = 0; i < 27; i++) {
+            qpt.SkipThresholdArrayIndex[i] = vdenc_const_skip_threshold_p[i];
+            qpt.SICForwardTransformCoeffThresholdMatrix0ArrayIndex[i] = vdenc_const_sic_forward_transform_coeff_threshold_0_p[i];
+            qpt.SICForwardTransformCoeffThresholdMatrix135ArrayIndex[i] = vdenc_const_sic_forward_transform_coeff_threshold_1_p[i];
+            qpt.SICForwardTransformCoeffThresholdMatrix2ArrayIndex[i] = vdenc_const_sic_forward_transform_coeff_threshold_2_p[i];
+            qpt.SICForwardTransformCoeffThresholdMatrix46ArrayIndex[i] = vdenc_const_sic_forward_transform_coeff_threshold_3_p[i];
+         }
+
+         if (!pps->flags.transform_8x8_mode_flag) {
+            for (uint32_t i = 0; i < 27; i++) {
+               qpt.SkipThresholdArrayIndex[i] /= 2;
+            }
+         }
+      }
+   }
+#endif
+
+   anv_h264_emit_mfx_avc_img_state(cmd, NULL, enc_info, brc_enabled);
+
+#if GFX_VERx10 >= 125
+   /* VDENC_CONST_QPT_STATE_CMD and VDENC_IMG_STATE has been changed to
+    * VDENC_CMD3 and VDENC_AVC_IMG_STATE_CMD for Gen125 */
+   {
+      anv_h264_emit_vdenc_cmd3(cmd, NULL, enc_info);
+
+      anv_h264_emit_vdenc_avc_img_state(cmd, NULL, enc_info, dpb_idx);
+   }
+#else
+   anv_h264_emit_vdenc_img_state(cmd, NULL, enc_info);
+#endif
 
    if (pps->flags.pic_scaling_matrix_present_flag) {
       /* TODO. */
@@ -1408,14 +1409,6 @@ anv_h264_emit_mfx_qm_state(struct anv_cmd_buffer *cmd,
             qm.ForwardQuantizerMatrix[q] = 0x10;
       }
    }
-}
-
-static void
-anv_h264_emit_mfx_fqm_state(struct anv_cmd_buffer *cmd,
-                            const VkVideoEncodeInfoKHR *enc_info)
-{
-   const StdVideoH264SequenceParameterSet *sps = anv_h264_sps(cmd, enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
 
    if (pps->flags.pic_scaling_matrix_present_flag) {
       /* TODO. */
@@ -1493,481 +1486,347 @@ anv_h264_emit_mfx_fqm_state(struct anv_cmd_buffer *cmd,
                fqm.QuantizerMatrix8x8[q] = 0x10;
       }
    }
-}
 
-static void
-anv_h264_emit_mfx_avc_directmode_state(struct anv_cmd_buffer *cmd,
-                                       const VkVideoEncodeInfoKHR *enc_info,
-                                       const uint8_t *dpb_idx)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-
-   anv_batch_emit(&cmd->batch, GENX(MFX_AVC_DIRECTMODE_STATE), avc_directmode) {
-      for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
-         int slot_idx = enc_info->pReferenceSlots[i].slotIndex;
-         if (slot_idx < 0)
-            continue;
-         int32_t poc = anv_h264_dpb_slot_poc(enc_info, slot_idx);
-         avc_directmode.POCList[2 * dpb_idx[slot_idx]] = poc;
-         avc_directmode.POCList[2 * dpb_idx[slot_idx] + 1] = poc;
-      }
-      avc_directmode.POCList[32] = frame_info->pStdPictureInfo->PicOrderCnt;
-      avc_directmode.POCList[33] = frame_info->pStdPictureInfo->PicOrderCnt;
-      avc_directmode.DirectMVBufferAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      avc_directmode.DirectMVBufferWriteAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-   }
-}
-
-static void
-anv_h264_emit_mfx_avc_ref_idx_state(struct anv_cmd_buffer *cmd,
-                                    const VkVideoEncodeInfoKHR *enc_info,
-                                    uint32_t slice_id,
-                                    const uint8_t *dpb_idx)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info = frame_info->pStdPictureInfo->pRefLists;
-   const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
-   const StdVideoEncodeH264SliceHeader *slice_header = nalu->pStdSliceHeader;
-   uint32_t slice_type = slice_header->slice_type % 5;
-
-   if (slice_type != STD_VIDEO_H264_SLICE_TYPE_I) {
-      anv_batch_emit(&cmd->batch, GENX(MFX_AVC_REF_IDX_STATE), ref) {
-         ref.ReferencePictureListSelect = 0;
-
-         for (uint32_t i = 0; i < 32; i++) {
-            uint8_t slot = i < ref_list_info->num_ref_idx_l0_active_minus1 + 1u ?
-                           ref_list_info->RefPicList0[i] :
-                           STD_VIDEO_H264_NO_REFERENCE_PICTURE;
-            ref.ReferenceListEntry[i] =
-               slot == STD_VIDEO_H264_NO_REFERENCE_PICTURE ? 0x80 : (dpb_idx[slot] << 1);
-
+   if (frame_info->pStdPictureInfo->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_B) {
+      anv_batch_emit(&cmd->batch, GENX(MFX_AVC_DIRECTMODE_STATE), avc_directmode) {
+         for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
+            int slot_idx = enc_info->pReferenceSlots[i].slotIndex;
+            if (slot_idx < 0)
+               continue;
+            int32_t poc = anv_h264_dpb_slot_poc(enc_info, slot_idx);
+            avc_directmode.POCList[2 * dpb_idx[slot_idx]] = poc;
+            avc_directmode.POCList[2 * dpb_idx[slot_idx] + 1] = poc;
          }
+         avc_directmode.POCList[32] = frame_info->pStdPictureInfo->PicOrderCnt;
+         avc_directmode.POCList[33] = frame_info->pStdPictureInfo->PicOrderCnt;
+         avc_directmode.DirectMVBufferAttributes =
+            ANV_VID_ATTR(cmd->device, NULL);
+         avc_directmode.DirectMVBufferWriteAttributes =
+            ANV_VID_ATTR(cmd->device, NULL);
       }
    }
-
-   if (slice_type == STD_VIDEO_H264_SLICE_TYPE_B) {
-      anv_batch_emit(&cmd->batch, GENX(MFX_AVC_REF_IDX_STATE), ref) {
-         ref.ReferencePictureListSelect = 1;
-
-         for (uint32_t i = 0; i < 32; i++) {
-            uint8_t slot = i < ref_list_info->num_ref_idx_l1_active_minus1 + 1u ?
-                           ref_list_info->RefPicList1[i] :
-                           STD_VIDEO_H264_NO_REFERENCE_PICTURE;
-            ref.ReferenceListEntry[i] =
-               slot == STD_VIDEO_H264_NO_REFERENCE_PICTURE ? 0x80 : (dpb_idx[slot] << 1);
-         }
-      }
-   }
-}
-
-static void
-anv_h264_emit_mfx_avc_weightoffset_state(struct anv_cmd_buffer *cmd,
-                                         const VkVideoEncodeInfoKHR *enc_info,
-                                         uint32_t slice_id)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
-   const StdVideoEncodeH264SliceHeader *slice_header = nalu->pStdSliceHeader;
-   uint32_t slice_type = slice_header->slice_type % 5;
-
-   if (pps->flags.weighted_pred_flag && slice_type == STD_VIDEO_H265_SLICE_TYPE_P) {
-      /* TODO. */
-      assert(0);
-      anv_batch_emit(&cmd->batch, GENX(MFX_AVC_WEIGHTOFFSET_STATE), w) {
-      }
-   }
-
-   if (pps->flags.weighted_pred_flag && slice_type == STD_VIDEO_H265_SLICE_TYPE_B) {
-      /* TODO. */
-      assert(0);
-      anv_batch_emit(&cmd->batch, GENX(MFX_AVC_WEIGHTOFFSET_STATE), w) {
-      }
-   }
-}
-
-static void
-anv_h264_emit_mfx_avc_slice_state(struct anv_cmd_buffer *cmd,
-                                  const VkVideoEncodeInfoKHR *enc_info,
-                                  uint32_t slice_id)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264SequenceParameterSet *sps = anv_h264_sps(cmd, enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   const StdVideoEncodeH264ReferenceListsInfo *ref_list_info = frame_info->pStdPictureInfo->pRefLists;
-   const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
-   const StdVideoEncodeH264SliceHeader *slice_header = nalu->pStdSliceHeader;
-   const StdVideoEncodeH264SliceHeader *next_slice_header = NULL;
-
-   bool is_last = (slice_id == frame_info->naluSliceEntryCount - 1);
-   uint32_t slice_type = slice_header->slice_type % 5;
-   uint32_t slice_qp = anv_h264_slice_qp(cmd, enc_info, slice_id);
-   uint32_t first_mb = slice_id == 0 ? 0 : slice_header->first_mb_in_slice;
-
-   if (!is_last)
-      next_slice_header = slice_header + 1;
-
-   const StdVideoEncodeH264WeightTable*      weight_table =  slice_header->pWeightTable;
-
-   unsigned w_in_mb = sps->pic_width_in_mbs_minus1 + 1;
-   unsigned h_in_mb = sps->pic_height_in_map_units_minus1 + 1;
-
-   anv_batch_emit(&cmd->batch, GENX(MFX_AVC_SLICE_STATE), avc_slice) {
-      avc_slice.SliceType = slice_type;
-
-      if (slice_type != STD_VIDEO_H264_SLICE_TYPE_I && weight_table) {
-         avc_slice.Log2WeightDenominatorLuma = weight_table->luma_log2_weight_denom;
-         avc_slice.Log2WeightDenominatorChroma = weight_table->chroma_log2_weight_denom;
-      }
-
-      avc_slice.NumberofReferencePicturesinInterpredictionList0 =
-         slice_type == STD_VIDEO_H264_SLICE_TYPE_I ? 0 : ref_list_info->num_ref_idx_l0_active_minus1 + 1;
-      avc_slice.NumberofReferencePicturesinInterpredictionList1 =
-         (slice_type == STD_VIDEO_H264_SLICE_TYPE_I ||
-          slice_type == STD_VIDEO_H264_SLICE_TYPE_P) ? 0 : ref_list_info->num_ref_idx_l1_active_minus1 + 1;
-
-      avc_slice.SliceAlphaC0OffsetDiv2 = slice_header->slice_alpha_c0_offset_div2 & 0x7;
-      avc_slice.SliceBetaOffsetDiv2 = slice_header->slice_beta_offset_div2 & 0x7;
-      avc_slice.SliceQuantizationParameter = slice_qp;
-      avc_slice.CABACInitIDC = slice_header->cabac_init_idc;
-      avc_slice.DisableDeblockingFilterIndicator =
-         pps->flags.deblocking_filter_control_present_flag ? slice_header->disable_deblocking_filter_idc : 0;
-      avc_slice.DirectPredictionType = slice_header->flags.direct_spatial_mv_pred_flag;
-
-      avc_slice.SliceStartMBNumber = first_mb;
-      avc_slice.SliceHorizontalPosition = first_mb % (w_in_mb);
-      avc_slice.SliceVerticalPosition = first_mb / (w_in_mb);
-
-      if (is_last) {
-         avc_slice.NextSliceHorizontalPosition = 0;
-         avc_slice.NextSliceVerticalPosition = h_in_mb;
-      } else {
-         avc_slice.NextSliceHorizontalPosition = next_slice_header->first_mb_in_slice % w_in_mb;
-         avc_slice.NextSliceVerticalPosition = next_slice_header->first_mb_in_slice / w_in_mb;
-      }
-
-      avc_slice.SliceID = slice_id;
-      avc_slice.CABACZeroWordInsertionEnable = 1;
-      avc_slice.EmulationByteSliceInsertEnable = 1;
-      avc_slice.SliceDataInsertionPresent = 1;
-      avc_slice.HeaderInsertionPresent = 1;
-      avc_slice.LastSliceGroup = is_last;
-      avc_slice.RateControlCounterEnable = false;
-
-      /* TODO. Available only when RateControlCounterEnable is true. */
-      avc_slice.RateControlPanicType = CBPPanic;
-      avc_slice.RateControlPanicEnable = false;
-      avc_slice.RateControlTriggleMode = LooseRateControl;
-      avc_slice.ResetRateControlCounter = true;
-      avc_slice.IndirectPAKBSEDataStartAddress = enc_info->dstBufferOffset;
-
-      avc_slice.RoundIntra = 5;
-      avc_slice.RoundIntraEnable = true;
-      /* TODO. Needs to get a different value of rounding inter under various conditions. */
-      avc_slice.RoundInter = 2;
-      avc_slice.RoundInterEnable = false;
-
-      if (slice_type == STD_VIDEO_H264_SLICE_TYPE_P) {
-         avc_slice.WeightedPredictionIndicator = pps->flags.weighted_pred_flag;
-         avc_slice.NumberofReferencePicturesinInterpredictionList0 =
-            ref_list_info->num_ref_idx_l0_active_minus1 + 1;
-      } else if (slice_type == STD_VIDEO_H264_SLICE_TYPE_B) {
-         avc_slice.WeightedPredictionIndicator = pps->weighted_bipred_idc;
-         avc_slice.NumberofReferencePicturesinInterpredictionList0 =
-            ref_list_info->num_ref_idx_l0_active_minus1 + 1;
-         avc_slice.NumberofReferencePicturesinInterpredictionList1 =
-            ref_list_info->num_ref_idx_l1_active_minus1 + 1;
-      }
-   }
-}
-
-static void
-anv_h264_emit_slice_header(struct anv_cmd_buffer *cmd,
-                           const VkVideoEncodeInfoKHR *enc_info,
-                           uint32_t slice_id)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const StdVideoH264SequenceParameterSet *sps = anv_h264_sps(cmd, enc_info);
-   const StdVideoH264PictureParameterSet *pps = anv_h264_pps(cmd, enc_info);
-   const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
-   const StdVideoEncodeH264SliceHeader *slice_header = nalu->pStdSliceHeader;
-   uint32_t slice_qp = anv_h264_slice_qp(cmd, enc_info, slice_id);
-   uint32_t first_mb = slice_id == 0 ? 0 : slice_header->first_mb_in_slice;
-
-   uint8_t slice_header_data[256] = { 0, };
-   size_t slice_header_data_len_in_bits = 0;
-   StdVideoEncodeH264SliceHeader slice_header_tmp = *slice_header;
-   slice_header_tmp.first_mb_in_slice = first_mb;
-   vk_video_encode_h264_slice_header(frame_info->pStdPictureInfo,
-                                     sps,
-                                     pps,
-                                     &slice_header_tmp,
-                                     slice_qp - (pps->pic_init_qp_minus26 + 26),
-                                     &slice_header_data_len_in_bits,
-                                     &slice_header_data);
-
-   uint32_t length_in_dw, data_bits_in_last_dw;
-   uint32_t *dw;
-
-   /* Insert zero slice data */
-   unsigned int insert_zero[] = { 0, };
-   length_in_dw = 1;
-   data_bits_in_last_dw = 8;
-
-   dw = anv_batch_emitn(&cmd->batch, length_in_dw + 2, GENX(MFX_PAK_INSERT_OBJECT),
-         .DataBitsInLastDW = data_bits_in_last_dw > 0 ? data_bits_in_last_dw : 32,
-         .HeaderLengthExcludedFromSize =  ACCUMULATE);
-
-   memcpy(dw + 2, insert_zero, length_in_dw * 4);
-
-   slice_header_data_len_in_bits -= 8;
-
-   length_in_dw = align((uint32_t)slice_header_data_len_in_bits, 32) >> 5;
-   data_bits_in_last_dw = slice_header_data_len_in_bits & 0x1f;
-
-   dw = anv_batch_emitn(&cmd->batch, length_in_dw + 2, GENX(MFX_PAK_INSERT_OBJECT),
-            .LastHeader = true,
-            .DataBitsInLastDW = data_bits_in_last_dw > 0 ? data_bits_in_last_dw : 32,
-            .SliceHeaderIndicator = true,
-            .HeaderLengthExcludedFromSize =  ACCUMULATE);
-
-   memcpy(dw + 2, slice_header_data + 1, length_in_dw * 4);
-}
-
-#if GFX_VERx10 >= 125
-static void
-anv_h264_emit_vdenc_avc_slice_state(struct anv_cmd_buffer *cmd,
-                                    const VkVideoEncodeInfoKHR *enc_info,
-                                    uint32_t slice_id)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
-   const StdVideoEncodeH264SliceHeader *slice_header = nalu->pStdSliceHeader;
-   uint32_t slice_type = slice_header->slice_type % 5;
-   const StdVideoEncodeH264WeightTable*      weight_table =  slice_header->pWeightTable;
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_AVC_SLICE_STATE), slice_state) {
-      slice_state.RoundIntra = 5;
-      slice_state.RoundIntraEnable = true;
-      if (slice_type == STD_VIDEO_H264_SLICE_TYPE_I) {
-         slice_state.RoundInter = 2;
-         slice_state.RoundInterEnable = false;
-      } else {
-         slice_state.RoundInter = 3;
-         slice_state.RoundInterEnable = false;
-      }
-      slice_state.Log2WeightDenomLuma =
-         weight_table ? weight_table->luma_log2_weight_denom : 0;
-   }
-}
-#endif
-
-static void
-anv_h264_emit_vdenc_walker_state(struct anv_cmd_buffer *cmd,
-                                 const VkVideoEncodeInfoKHR *enc_info,
-                                 uint32_t slice_id)
-{
-   const StdVideoH264SequenceParameterSet *sps = anv_h264_sps(cmd, enc_info);
-#if GFX_VERx10 < 125
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
-   const StdVideoEncodeH264SliceHeader *slice_header = nalu->pStdSliceHeader;
-   const StdVideoEncodeH264WeightTable*      weight_table =  slice_header->pWeightTable;
-#if GFX_VER >= 12
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-   const struct anv_image *src_img = iv->image;
-#endif
-#endif
-   unsigned h_in_mb = sps->pic_height_in_map_units_minus1 + 1;
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_WALKER_STATE), vdenc_walker) {
-      vdenc_walker.NextSliceMBStartYPosition = h_in_mb;
-#if GFX_VERx10 < 125
-      vdenc_walker.Log2WeightDenominatorLuma = weight_table ? weight_table->luma_log2_weight_denom : 0;
-#if GFX_VER >= 12
-      vdenc_walker.TileWidth = src_img->vk.extent.width - 1;
-#endif
-#else
-      vdenc_walker.FirstSuperSlice = 1;
-#endif
-   }
-}
 
 #if GFX_VER >= 12
-static void
-anv_h264_brc_init_update(struct anv_cmd_buffer *cmd,
-                         const VkVideoEncodeInfoKHR *enc_info,
-                         const uint8_t *dpb_idx,
-                         struct anv_state brc_input_slb)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const struct anv_video_session *vid = cmd->video.vid;
-
-   anv_h264_brc_build_input_slb(cmd, enc_info, dpb_idx, brc_input_slb);
-
-   /* frame_counter == 0 means the HuC BRC running state has not been set
-    * up yet (fresh session or after a RESET), so run the init pass. */
-   if (vid->rc.frame_counter == 0)
-      anv_h264_brc_emit_huc_init(cmd, frame_info);
-   anv_h264_brc_emit_huc_update(cmd, frame_info, 0, brc_input_slb);
-
-   /* The encode PAK reads the HuC-patched image state from the SLBB. */
-   anv_batch_emit(&cmd->batch, GENX(MI_BATCH_BUFFER_START), bbs) {
-      bbs.SecondLevelBatchBuffer = Secondlevelbatch;
-      bbs.AddressSpaceIndicator = ASI_PPGTT;
-      bbs.BatchBufferStartAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_EXEC_SLB);
-   }
-}
-
-static void
-anv_h264_brc_store_pak_stats(struct anv_cmd_buffer *cmd,
-                             const VkVideoEncodeInfoKHR *enc_info,
-                             struct anv_state brc_input_slb)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   const struct anv_video_session *vid = cmd->video.vid;
-
-   /* Stage this frame's PAK MMIO outputs into the persistent PAK info
-    * buffer. The next frame's HuC BRC Update copies them into its DMEM so
-    * it can measure the encoded size and drive the bitrate. */
-   struct anv_address pak_info =
-      ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_PAK_INFO);
-   anv_batch_emit(&cmd->batch, GENX(MI_STORE_REGISTER_MEM), srm) {
-      srm.RegisterAddress = ANV_H264_MFC_BITSTREAM_BYTECOUNT_FRAME_OFFSET;
-      srm.AddCSMMIOStartOffset = 1;
-      srm.MemoryAddress = pak_info;
-   }
-   anv_batch_emit(&cmd->batch, GENX(MI_STORE_REGISTER_MEM), srm) {
-      srm.RegisterAddress = ANV_H264_MFC_IMAGE_STATUS_CTRL_OFFSET;
-      srm.AddCSMMIOStartOffset = 1;
-      srm.MemoryAddress = anv_address_add(pak_info, 4);
-   }
-   anv_batch_emit(&cmd->batch, GENX(MI_STORE_REGISTER_MEM), srm) {
-      srm.RegisterAddress = ANV_H264_MFC_AVC_NUM_SLICES_OFFSET;
-      srm.AddCSMMIOStartOffset = 1;
-      srm.MemoryAddress = anv_address_add(pak_info, 8);
-   }
-
-   /* Second BRC pass: after the encode, run the HuC BRC Update again with
-    * this frame's actual PAK result (now staged in PAK_INFO) so it folds
-    * the running rate state into the history buffer (region 0).
-    * The pass-0 update only predicts QP and does
-    * not write history, so without this pass the history never advances and
-    * the QP stays pinned at the init value.
+   /* H.264 HuC BRC: the HuC reads the image state group from the input SLB,
+    * computes the frame QP and writes a patched copy into the output SLB.
+    * Executing that group here (after the direct image state, before the
+    * slices) makes the patched QP the one the slices below encode with.
     */
-   anv_video_emit_mi_flush_dw(cmd, true);
-   anv_h264_brc_emit_huc_update(cmd, frame_info, 1, brc_input_slb);
-}
-
-#endif
-
-static void
-anv_h264_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
-{
-   const struct VkVideoEncodeH264PictureInfoKHR *frame_info = anv_h264_frame_info(enc_info);
-   uint8_t dpb_idx[ANV_VIDEO_H264_MAX_NUM_REF_FRAME] = { 0,};
-
-   for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
-      int slot_idx = enc_info->pReferenceSlots[i].slotIndex;
-      assert(slot_idx < ANV_VIDEO_H264_MAX_NUM_REF_FRAME);
-
-      dpb_idx[slot_idx] = i;
-   }
-
-   bool brc_enabled = false;
-   struct anv_video_session *vid = cmd->video.vid;
-   brc_enabled =
-      vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR ||
-      vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR;
-
-#if GFX_VER >= 12
-   struct anv_state brc_input_slb = ANV_STATE_NULL;
-#endif
-
-   anv_video_emit_mi_flush_dw(cmd, true);
-   anv_h264_emit_startup(cmd);
-   anv_h264_emit_mfx_pipe_mode_select(cmd, enc_info);
-
-#if GFX_VER >= 12
-   anv_video_emit_mfx_wait(cmd, NULL);
-#endif
-
-   anv_h264_emit_mfx_surface_state(cmd, enc_info);
-   anv_h264_emit_mfx_pipe_buf_addr_state(cmd, enc_info, brc_enabled);
-   anv_h264_emit_mfx_ind_obj_base_addr_state(cmd, enc_info);
-   anv_h264_emit_mfx_bsp_buf_base_addr_state(cmd, enc_info);
-   anv_h264_emit_vdenc_pipe_mode_select(cmd, enc_info, brc_enabled);
-   anv_h264_emit_vdenc_src_surface_state(cmd, enc_info);
-   anv_h264_emit_vdenc_ref_surface_state(cmd, enc_info);
-   anv_h264_emit_vdenc_ds_ref_surface_state(cmd, enc_info);
-   anv_h264_emit_vdenc_pipe_buf_addr_state(cmd, enc_info, dpb_idx, brc_enabled);
-
-#if GFX_VERx10 < 125
-   anv_h264_emit_vdenc_const_qpt_state(cmd, enc_info);
-#endif
-
-#if GFX_VER >= 12
    if (brc_enabled) {
-      brc_input_slb = anv_cmd_buffer_alloc_temporary_state(cmd,
-         align(ANV_H264_BRC_SLB_SIZE, 4096), 4096);
-      if (brc_input_slb.map == NULL)
-         return;
+      struct anv_state slb_state =
+         anv_cmd_buffer_alloc_temporary_state(cmd,
+            align(ANV_H264_BRC_SLB_SIZE, 4096), 4096);
+      if (slb_state.map != NULL) {
+         anv_h264_brc_build_input_slb(cmd, enc_info, dpb_idx, slb_state);
 
-      anv_h264_brc_init_update(cmd, enc_info, dpb_idx, brc_input_slb);
-   } else
-#endif
-   {
-      anv_h264_emit_mfx_avc_img_state(cmd, NULL, enc_info, false);
-#if GFX_VERx10 >= 125
-      /* VDENC_CONST_QPT_STATE_CMD and VDENC_IMG_STATE has been changed to
-       * VDENC_CMD3 and VDENC_AVC_IMG_STATE_CMD for Gen125 */
-      anv_h264_emit_vdenc_cmd3(cmd, NULL, enc_info);
-      anv_h264_emit_vdenc_avc_img_state(cmd, NULL, enc_info, dpb_idx);
-#else
-      anv_h264_emit_vdenc_img_state(cmd, NULL, enc_info);
-#endif
+         if (vid->rc.frame_counter == 0)
+            anv_h264_brc_emit_huc_init(cmd, frame_info);
+
+         for (uint32_t pass = 0; pass < 2; pass++)
+            anv_h264_brc_emit_huc_update(cmd, frame_info, pass, slb_state);
+
+         struct anv_address exec_slb =
+            anv_brc_mem_addr(vid, ANV_VID_MEM_BRC_EXEC_SLB +
+                                  (vid->rc.frame_counter % 6));
+         anv_batch_emit(&cmd->batch, GENX(MI_BATCH_BUFFER_START), bbs) {
+            bbs.AddressSpaceIndicator = ASI_PPGTT;
+            bbs.SecondLevelBatchBuffer = Secondlevelbatch;
+            bbs.BatchBufferStartAddress = exec_slb;
+         }
+      }
    }
-
-   anv_h264_emit_mfx_qm_state(cmd, enc_info);
-   anv_h264_emit_mfx_fqm_state(cmd, enc_info);
-
-   if (frame_info->pStdPictureInfo->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_B)
-      anv_h264_emit_mfx_avc_directmode_state(cmd, enc_info, dpb_idx);
+#endif
 
    for (uint32_t slice_id = 0; slice_id < frame_info->naluSliceEntryCount; slice_id++) {
-      anv_h264_emit_mfx_avc_ref_idx_state(cmd, enc_info, slice_id, dpb_idx);
-      anv_h264_emit_mfx_avc_weightoffset_state(cmd, enc_info, slice_id);
-      anv_h264_emit_mfx_avc_slice_state(cmd, enc_info, slice_id);
-      anv_h264_emit_slice_header(cmd, enc_info, slice_id);
-      anv_vdenc_emit_weightsoffsets_state(cmd, NULL, false);
-#if GFX_VERx10 >= 125
-      anv_h264_emit_vdenc_avc_slice_state(cmd, enc_info, slice_id);
+      const VkVideoEncodeH264NaluSliceInfoKHR *nalu = &frame_info->pNaluSliceEntries[slice_id];
+      const StdVideoEncodeH264SliceHeader *slice_header = nalu->pStdSliceHeader;
+      const StdVideoEncodeH264SliceHeader *next_slice_header = NULL;
+
+      bool is_last = (slice_id == frame_info->naluSliceEntryCount - 1);
+      uint32_t slice_type = slice_header->slice_type % 5;
+      uint32_t slice_qp = rc_disable ? nalu->constantQp : pps->pic_init_qp_minus26 + 26;
+      uint32_t first_mb = slice_id == 0 ? 0 : slice_header->first_mb_in_slice;
+
+      if (!is_last)
+         next_slice_header = slice_header + 1;
+
+      if (slice_type != STD_VIDEO_H264_SLICE_TYPE_I) {
+         anv_batch_emit(&cmd->batch, GENX(MFX_AVC_REF_IDX_STATE), ref) {
+            ref.ReferencePictureListSelect = 0;
+
+            for (uint32_t i = 0; i < 32; i++) {
+               uint8_t slot = i < ref_list_info->num_ref_idx_l0_active_minus1 + 1u ?
+                              ref_list_info->RefPicList0[i] :
+                              STD_VIDEO_H264_NO_REFERENCE_PICTURE;
+               ref.ReferenceListEntry[i] =
+                  slot == STD_VIDEO_H264_NO_REFERENCE_PICTURE ? 0x80 : dpb_idx[slot];
+            }
+         }
+      }
+
+      if (slice_type == STD_VIDEO_H264_SLICE_TYPE_B) {
+         anv_batch_emit(&cmd->batch, GENX(MFX_AVC_REF_IDX_STATE), ref) {
+            ref.ReferencePictureListSelect = 1;
+
+            for (uint32_t i = 0; i < 32; i++) {
+               uint8_t slot = i < ref_list_info->num_ref_idx_l1_active_minus1 + 1u ?
+                              ref_list_info->RefPicList1[i] :
+                              STD_VIDEO_H264_NO_REFERENCE_PICTURE;
+               ref.ReferenceListEntry[i] =
+                  slot == STD_VIDEO_H264_NO_REFERENCE_PICTURE ? 0x80 : dpb_idx[slot];
+            }
+         }
+      }
+
+      if (pps->flags.weighted_pred_flag && slice_type == STD_VIDEO_H265_SLICE_TYPE_P) {
+         /* TODO. */
+         assert(0);
+         anv_batch_emit(&cmd->batch, GENX(MFX_AVC_WEIGHTOFFSET_STATE), w) {
+         }
+      }
+
+      if (pps->flags.weighted_pred_flag && slice_type == STD_VIDEO_H265_SLICE_TYPE_B) {
+         /* TODO. */
+         assert(0);
+         anv_batch_emit(&cmd->batch, GENX(MFX_AVC_WEIGHTOFFSET_STATE), w) {
+         }
+      }
+
+      const StdVideoEncodeH264WeightTable*      weight_table =  slice_header->pWeightTable;
+
+      unsigned w_in_mb = sps->pic_width_in_mbs_minus1 + 1;
+      unsigned h_in_mb = sps->pic_height_in_map_units_minus1 + 1;
+
+      uint8_t slice_header_data[256] = { 0, };
+      size_t slice_header_data_len_in_bits = 0;
+      StdVideoEncodeH264SliceHeader slice_header_tmp = *slice_header;
+      slice_header_tmp.first_mb_in_slice = first_mb;
+      vk_video_encode_h264_slice_header(frame_info->pStdPictureInfo,
+                                        sps,
+                                        pps,
+                                        &slice_header_tmp,
+                                        slice_qp - (pps->pic_init_qp_minus26 + 26),
+                                        &slice_header_data_len_in_bits,
+                                        &slice_header_data);
+
+      anv_batch_emit(&cmd->batch, GENX(MFX_AVC_SLICE_STATE), avc_slice) {
+         avc_slice.SliceType = slice_type;
+
+         if (slice_type != STD_VIDEO_H264_SLICE_TYPE_I && weight_table) {
+            avc_slice.Log2WeightDenominatorLuma = weight_table->luma_log2_weight_denom;
+            avc_slice.Log2WeightDenominatorChroma = weight_table->chroma_log2_weight_denom;
+         }
+
+         avc_slice.NumberofReferencePicturesinInterpredictionList0 =
+            slice_type == STD_VIDEO_H264_SLICE_TYPE_I ? 0 : ref_list_info->num_ref_idx_l0_active_minus1 + 1;
+         avc_slice.NumberofReferencePicturesinInterpredictionList1 =
+            (slice_type == STD_VIDEO_H264_SLICE_TYPE_I ||
+             slice_type == STD_VIDEO_H264_SLICE_TYPE_P) ? 0 : ref_list_info->num_ref_idx_l1_active_minus1 + 1;
+
+         avc_slice.SliceAlphaC0OffsetDiv2 = slice_header->slice_alpha_c0_offset_div2 & 0x7;
+         avc_slice.SliceBetaOffsetDiv2 = slice_header->slice_beta_offset_div2 & 0x7;
+         avc_slice.SliceQuantizationParameter = slice_qp;
+         avc_slice.CABACInitIDC = slice_header->cabac_init_idc;
+         avc_slice.DisableDeblockingFilterIndicator =
+            pps->flags.deblocking_filter_control_present_flag ? slice_header->disable_deblocking_filter_idc : 0;
+         avc_slice.DirectPredictionType = slice_header->flags.direct_spatial_mv_pred_flag;
+
+         avc_slice.SliceStartMBNumber = first_mb;
+         avc_slice.SliceHorizontalPosition = first_mb % (w_in_mb);
+         avc_slice.SliceVerticalPosition = first_mb / (w_in_mb);
+
+         if (is_last) {
+            avc_slice.NextSliceHorizontalPosition = 0;
+            avc_slice.NextSliceVerticalPosition = h_in_mb;
+#if GFX_VER >= 20
+            /* Xe2 has an 8-bit next-slice Y field. Match media-driver's
+             * bitfield truncation for a 4096-line picture (256 MB rows);
+             * LastSliceGroup below marks the end of the picture.
+             */
+            avc_slice.NextSliceVerticalPosition &= 0xff;
 #endif
-      anv_h264_emit_vdenc_walker_state(cmd, enc_info, slice_id);
-      anv_vdenc_emit_vd_pipeline_flush(cmd);
+         } else {
+            avc_slice.NextSliceHorizontalPosition = next_slice_header->first_mb_in_slice % w_in_mb;
+            avc_slice.NextSliceVerticalPosition = next_slice_header->first_mb_in_slice / w_in_mb;
+         }
+
+         avc_slice.SliceID = slice_id;
+         avc_slice.CABACZeroWordInsertionEnable = 1;
+         avc_slice.EmulationByteSliceInsertEnable = 1;
+         avc_slice.SliceDataInsertionPresent = 1;
+         avc_slice.HeaderInsertionPresent = 1;
+         avc_slice.LastSliceGroup = is_last;
+         avc_slice.RateControlCounterEnable = false;
+
+         /* TODO. Available only when RateControlCounterEnable is true. */
+         avc_slice.RateControlPanicType = CBPPanic;
+         avc_slice.RateControlPanicEnable = false;
+         avc_slice.RateControlTriggleMode = LooseRateControl;
+         avc_slice.ResetRateControlCounter = true;
+         avc_slice.IndirectPAKBSEDataStartAddress = enc_info->dstBufferOffset;
+
+         avc_slice.RoundIntra = 5;
+         avc_slice.RoundIntraEnable = true;
+         /* TODO. Needs to get a different value of rounding inter under various conditions. */
+         avc_slice.RoundInter = 2;
+         avc_slice.RoundInterEnable = false;
+
+         if (slice_type == STD_VIDEO_H264_SLICE_TYPE_P) {
+            avc_slice.WeightedPredictionIndicator = pps->flags.weighted_pred_flag;
+            avc_slice.NumberofReferencePicturesinInterpredictionList0 = ref_list_info->num_ref_idx_l0_active_minus1 + 1;
+         } else if (slice_type == STD_VIDEO_H264_SLICE_TYPE_B) {
+            avc_slice.WeightedPredictionIndicator = pps->weighted_bipred_idc;
+            avc_slice.NumberofReferencePicturesinInterpredictionList0 = ref_list_info->num_ref_idx_l0_active_minus1 + 1;
+            avc_slice.NumberofReferencePicturesinInterpredictionList1 = ref_list_info->num_ref_idx_l1_active_minus1 + 1;
+         }
+      }
+
+      uint32_t length_in_dw, data_bits_in_last_dw;
+      uint32_t *dw;
+
+      /* Insert zero slice data */
+      unsigned int insert_zero[] = { 0, };
+      length_in_dw = 1;
+      data_bits_in_last_dw = 8;
+
+      dw = anv_batch_emitn(&cmd->batch, length_in_dw + 2, GENX(MFX_PAK_INSERT_OBJECT),
+            .DataBitsInLastDW = data_bits_in_last_dw > 0 ? data_bits_in_last_dw : 32,
+            .HeaderLengthExcludedFromSize =  ACCUMULATE);
+
+      memcpy(dw + 2, insert_zero, length_in_dw * 4);
+
+      slice_header_data_len_in_bits -= 8;
+
+      length_in_dw = align((uint32_t)slice_header_data_len_in_bits, 32) >> 5;
+      data_bits_in_last_dw = slice_header_data_len_in_bits & 0x1f;
+
+      dw = anv_batch_emitn(&cmd->batch, length_in_dw + 2, GENX(MFX_PAK_INSERT_OBJECT),
+               .LastHeader = true,
+               .DataBitsInLastDW = data_bits_in_last_dw > 0 ? data_bits_in_last_dw : 32,
+               .SliceHeaderIndicator = true,
+               .HeaderLengthExcludedFromSize =  ACCUMULATE);
+
+      memcpy(dw + 2, slice_header_data + 1, length_in_dw * 4);
+
+      anv_batch_emit(&cmd->batch, GENX(VDENC_WEIGHTSOFFSETS_STATE), vdenc_offsets) {
+         vdenc_offsets.WeightsForwardReference0 = 1;
+         vdenc_offsets.WeightsForwardReference1 = 1;
+         vdenc_offsets.WeightsForwardReference2 = 1;
+         vdenc_offsets.HEVCVP9WeightsBackwardReference0 = 1;
+      }
+
+#if GFX_VERx10 >= 125
+      anv_batch_emit(&cmd->batch, GENX(VDENC_AVC_SLICE_STATE), slice_state) {
+         slice_state.RoundIntra = 5;
+         slice_state.RoundIntraEnable = true;
+         if (slice_type == STD_VIDEO_H264_SLICE_TYPE_I) {
+            slice_state.RoundInter = 2;
+            slice_state.RoundInterEnable = false;
+         } else {
+            slice_state.RoundInter = 3;
+            slice_state.RoundInterEnable = false;
+         }
+         slice_state.Log2WeightDenomLuma =
+            weight_table ? weight_table->luma_log2_weight_denom : 0;
+      }
+#endif
+
+      anv_batch_emit(&cmd->batch, GENX(VDENC_WALKER_STATE), vdenc_walker) {
+         vdenc_walker.NextSliceMBStartYPosition = h_in_mb;
+#if GFX_VERx10 < 125
+         vdenc_walker.Log2WeightDenominatorLuma = weight_table ? weight_table->luma_log2_weight_denom : 0;
+#if GFX_VER >= 12
+         vdenc_walker.TileWidth = src_img->vk.extent.width - 1;
+#endif
+#else
+         vdenc_walker.FirstSuperSlice = 1;
+#endif
+      }
+
+      anv_batch_emit(&cmd->batch, GENX(VD_PIPELINE_FLUSH), flush) {
+         flush.MFXPipelineDone = true;
+         flush.VDENCPipelineDone = true;
+         flush.VDCommandMessageParserDone = true;
+         flush.VDENCPipelineCommandFlush = true;
+      }
    }
 
-   anv_video_emit_mi_flush_dw(cmd, true);
+   anv_batch_emit(&cmd->batch, GENX(MI_FLUSH_DW), flush) {
+      flush.DWordLength = 2;
+      flush.VideoPipelineCacheInvalidate = 1;
+   };
 
 #if GFX_VER >= 12
-   if (brc_enabled) {
-      anv_h264_brc_store_pak_stats(cmd, enc_info, brc_input_slb);
+   if (brc_enabled)
       vid->rc.frame_counter++;
-   }
 #endif
 }
 
-static bool
+#if GFX_VER >= 12
+static const uint8_t hcp_transform_skip_coeffs_tbl[4][2][2][2][2] =
+{
+   { { { { 42, 37 },{ 32, 40 } },{ { 40, 40 },{ 32, 45 } } },
+     { { { 29, 48 },{ 26, 53 } },{ { 26, 56 },{ 24, 62 } } } },
+   { { { { 42, 40 },{ 32, 45 } },{ { 40, 46 },{ 32, 48 } } },
+     { { { 26, 53 },{ 24, 58 } },{ { 32, 53 },{ 26, 64 } } } },
+   { { { { 38, 42 },{ 32, 51 } },{ { 43, 43 },{ 35, 46 } } },
+     { { { 26, 56 },{ 24, 64 } },{ { 35, 50 },{ 32, 57 } } } },
+   { { { { 35, 46 },{ 32, 52 } },{ { 51, 42 },{ 38, 53 } } },
+     { { { 29, 56 },{ 29, 70 } },{ { 38, 47 },{ 37, 64 } } } },
+};
+
+static const uint16_t hcp_transform_skip_lambda_tbl[52] =
+{
+   149, 149, 149, 149, 149, 149, 149, 149,
+   149, 149, 149, 149, 149, 149, 149, 149,
+   149, 149, 149, 149, 149, 149, 149, 149,
+   149, 162, 174, 186, 199, 211, 224, 236,
+   249, 261, 273, 286, 298, 298, 298, 298,
+   298, 298, 298, 298, 298, 298, 298, 298,
+   298, 298, 298, 298
+};
+
+#if GFX_VERx10 < 125
+static const uint32_t hevc_sad_qp_lambda_tbl[3][42] =
+{
+   /* I-frame: QP 10-51 */
+   {
+      0x30002, 0x30002, 0x30002, 0x30003, 0x40004, 0x40005, 0x50006,
+      0x60008, 0x6000a, 0x7000c, 0x8000f, 0x90013, 0xa0018, 0xb001e,
+      0xc0026, 0xe0030, 0x10003d, 0x12004d, 0x140061, 0x16007a, 0x19009a,
+      0x1c00c2, 0x1f00f4, 0x230133, 0x270183, 0x2c01e8, 0x320266, 0x380306,
+      0x3e03cf, 0x4604cd, 0x4f060c, 0x58079f, 0x63099a, 0x6f0c18, 0x7d0f3d,
+      0x8c1333, 0x9d1831, 0xb11e7a, 0xc62666, 0xdf3062, 0xfa3cf5, 0x1184ccd
+   },
+   /* P-frame: QP 10-51 */
+   {
+      0x30003, 0x30003, 0x30003, 0x40003, 0x40004, 0x50005, 0x50007,
+      0x60008, 0x6000a, 0x7000d, 0x80011, 0x90015, 0xa001a, 0xb0021,
+      0xd002a, 0xe0034, 0x100042, 0x120053, 0x140069, 0x170084, 0x1a00a6,
+      0x1d00d2, 0x210108, 0x24014d, 0x2901a3, 0x2e0210, 0x34029a, 0x3a0347,
+      0x410421, 0x490533, 0x52068d, 0x5c0841, 0x670a66, 0x740d1a, 0x821082,
+      0x9214cd, 0xa41a35, 0xb82105, 0xce299a, 0xe8346a, 0x1044209, 0x1245333
+   },
+   /* B-frame: QP 10-51 */
+   {
+      0x30003, 0x30003, 0x30003, 0x40003, 0x40004, 0x50005, 0x50007,
+      0x60008, 0x6000a, 0x7000d, 0x80011, 0x90015, 0xa001a, 0xb0021,
+      0xd002a, 0xe0034, 0x100042, 0x120053, 0x140069, 0x170084, 0x1a00a6,
+      0x1d00d2, 0x210108, 0x24014d, 0x2901a3, 0x2e0210, 0x34029a, 0x3a0347,
+      0x410421, 0x490533, 0x52068d, 0x5c0841, 0x670a66, 0x740d1a, 0x821082,
+      0x9214cd, 0xa41a35, 0xb82105, 0xce299a, 0xe8346a, 0x1044209, 0x1245333
+   }
+};
+#endif
+
+#endif // GFX_VER >= 12
+
+static int32_t
 anv_h265_get_ref_poc(const VkVideoEncodeInfoKHR *enc_info,
                      const uint8_t slot_num,
-                     int32_t *ref_poc,
                      bool *long_term)
 {
-   *ref_poc = 0;
+   int32_t ref_poc = 0;
    *long_term = false;
 
    for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
@@ -1975,17 +1834,17 @@ anv_h265_get_ref_poc(const VkVideoEncodeInfoKHR *enc_info,
       const VkVideoEncodeH265DpbSlotInfoKHR *dpb =
             vk_find_struct_const(ref_slot_info.pNext, VIDEO_ENCODE_H265_DPB_SLOT_INFO_KHR);
 
-      if (!dpb)
+      if (!dpb || !dpb->pStdReferenceInfo)
          continue;
 
       if (ref_slot_info.slotIndex == slot_num) {
-         *ref_poc = dpb->pStdReferenceInfo->PicOrderCntVal;
-         *long_term |= dpb->pStdReferenceInfo->flags.used_for_long_term_reference;
-         return true;
+         ref_poc = dpb->pStdReferenceInfo->PicOrderCntVal;
+         *long_term = dpb->pStdReferenceInfo->flags.used_for_long_term_reference;
+         break;
       }
    }
 
-   return false;
+   return ref_poc;
 }
 
 static const VkVideoReferenceSlotInfoKHR *
@@ -2079,757 +1938,45 @@ lcu_max_bits_size_allowed(const StdVideoH265SequenceParameterSet *sps)
 }
 
 #if GFX_VER >= 12
-static const struct VkVideoEncodeH265PictureInfoKHR *
-anv_h265_frame_info(const VkVideoEncodeInfoKHR *enc_info)
+static void
+anv_vdenc_fill_hevc_ds_surface(struct GENX(VDENC_SURFACE_STATE_FIELDS) *ss,
+                               const struct anv_image *img, bool is_8x)
 {
-   return vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
-}
+   const struct anv_surface *surf =
+      is_8x ? &img->vid_vdenc_ds8x : &img->vid_vdenc_ds4x;
+   const uint32_t w = is_8x ? img->vid_vdenc_ds8x_width : img->vid_vdenc_ds4x_width;
+   const uint32_t h = is_8x ? img->vid_vdenc_ds8x_height : img->vid_vdenc_ds4x_height;
 
-static const StdVideoH265VideoParameterSet *
-anv_h265_vps(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
-{
-   return vk_video_find_h265_enc_std_vps(
-            cmd->video.params,
-            anv_h265_frame_info(enc_info)->pStdPictureInfo->sps_video_parameter_set_id);
-}
-
-static const StdVideoH265SequenceParameterSet *
-anv_h265_sps(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
-{
-   return vk_video_find_h265_enc_std_sps(
-            cmd->video.params,
-            anv_h265_frame_info(enc_info)->pStdPictureInfo->pps_seq_parameter_set_id);
-}
-
-static const StdVideoH265PictureParameterSet *
-anv_h265_pps(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
-{
-   return vk_video_find_h265_enc_std_pps(
-            cmd->video.params,
-            anv_h265_frame_info(enc_info)->pStdPictureInfo->pps_pic_parameter_set_id);
-}
-
-static bool
-anv_h265_is_10bit(const StdVideoH265SequenceParameterSet *sps)
-{
-   return (sps->bit_depth_luma_minus8 == 2) || (sps->bit_depth_chroma_minus8 == 2);
+   ss->Width = w - 1;
+   ss->Height = h - 1;
+   ss->SurfaceFormat = VDENC_PLANAR_420_8;
+   ss->SurfacePitch = surf->isl.row_pitch_B - 1;
+   ss->TileWalk = TW_YMAJOR;
+   ss->TiledSurface = surf->isl.tiling != ISL_TILING_LINEAR;
+   /* Packed NV12: chroma starts at luma height. Must be a multiple of 16. */
+   ss->YOffsetforUCb = h;
+   ss->YOffsetforVCr = h;
 }
 
 static void
-anv_h265_frame_size(const StdVideoH265SequenceParameterSet *sps,
-                    uint32_t *width_in_pix, uint32_t *height_in_pix)
+anv_vdenc_bind_ds_pic(struct GENX(VDENC_PICTURE) *pic,
+                      struct anv_cmd_buffer *cmd,
+                      const struct anv_image_view *iv, uint32_t layer,
+                      bool is_8x)
 {
-   uint32_t frame_width_in_min_cb =
-      sps->pic_width_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
-   uint32_t frame_height_in_min_cb =
-      sps->pic_height_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   struct anv_address addr = ANV_NULL_ADDRESS;
 
-   *width_in_pix = frame_width_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
-   *height_in_pix = frame_height_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
-}
+   if (iv && anv_image_has_vdenc_ds(iv->image))
+      addr = anv_image_vdenc_ds_address(iv, layer, is_8x);
 
-static uint32_t
-anv_h265_slice_qp(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info, uint32_t slice_id)
-{
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
-   const StdVideoH265PictureParameterSet *pps = anv_h265_pps(cmd, enc_info);
-   const VkVideoEncodeH265NaluSliceSegmentInfoKHR *nalu = &frame_info->pNaluSliceSegmentEntries[slice_id];
-
-   return anv_video_encode_quantizer(cmd->video.vid, nalu->constantQp,
-                                     pps->init_qp_minus26 + 26);
-}
-
-static uint8_t
-anv_h265_chroma_log2_weight_denom(const StdVideoH265PictureParameterSet *pps,
-                                  const StdVideoEncodeH265SliceSegmentHeader *slice_header)
-{
-   uint32_t slice_type = slice_header->slice_type % 5;
-
-   if ((pps->flags.weighted_pred_flag && (slice_type == STD_VIDEO_H265_SLICE_TYPE_P)) ||
-         (pps->flags.weighted_bipred_flag && (slice_type == STD_VIDEO_H265_SLICE_TYPE_B))) {
-      return slice_header->pWeightTable->luma_log2_weight_denom +
-             slice_header->pWeightTable->delta_chroma_log2_weight_denom;
-   }
-
-   return 0;
-}
-
-static void
-anv_h265_emit_hcp_pipe_mode_select(struct anv_cmd_buffer *cmd,
-                                   struct anv_batch *batch,
-                                   const VkVideoEncodeInfoKHR *enc_info,
-                                   bool brc_enabled)
-{
-   if (!batch)
-      batch = &cmd->batch;
-
-   anv_batch_emit(batch, GENX(HCP_PIPE_MODE_SELECT), sel) {
-      sel.CodecSelect = Encode;
-      sel.CodecStandardSelect = HEVC;
-      sel.VDEncMode = VM_VDEncMode;
-      sel.PAKPipelineStreamOutEnable = true;
-      sel.PAKFrameLevelStreamOutEnable = true;
-      sel.AdvancedRateControlEnable = brc_enabled;
-#if GFX_VER >= 20
-      /* Xe2 VDEnc RDOQ: the lambda table command is programmed, and the
-       * picture state enables RDOQ for intra transform units. */
-      sel.RDOQEnable = true;
-#endif
-   }
-}
-
-static void
-anv_h265_emit_hcp_surface_state(struct anv_cmd_buffer *cmd,
-                                const VkVideoEncodeInfoKHR *enc_info)
-{
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const bool is_10bit = anv_h265_is_10bit(sps);
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-   const struct anv_image *src_img = iv->image;
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv =
-      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-   const struct anv_image *base_ref_img = base_ref_iv->image;
-
-   for (uint32_t i = 0; i < 3; i++) {
-      anv_batch_emit(&cmd->batch, GENX(HCP_SURFACE_STATE), ss) {
-         struct anv_image *img_ = NULL;
-
-         switch(i) {
-            case 0:
-               img_ = (struct anv_image *) src_img;
-               ss.SurfaceID = HCP_SourceInputPicture;
-               break;
-            case 1:
-               //img_ = (struct anv_image *) src_img;
-               img_ = (struct anv_image *) base_ref_img;
-               ss.SurfaceID = HCP_CurrentDecodedPicture;
-               break;
-            case 2:
-               img_ = (struct anv_image *) base_ref_img;
-               ss.SurfaceID = HCP_ReferencePicture;
-               break;
-            default:
-               assert(0);
-         }
-
-         ss.SurfacePitch = img_->planes[0].primary_surface.isl.row_pitch_B - 1;
-         if (!is_10bit)
-            ss.SurfaceFormat = PLANAR_420_8;
-         else if (ss.SurfaceID == HCP_SourceInputPicture)
-            ss.SurfaceFormat = P010;
-         else
-            ss.SurfaceFormat = P010Variant;
-
-         ss.YOffsetforUCb = img_->planes[1].primary_surface.memory_range.offset /
-                            img_->planes[0].primary_surface.isl.row_pitch_B;
-         ss.YOffsetforVCr = ss.YOffsetforUCb;
-      }
-   }
-}
-
-static void
-anv_h265_emit_hcp_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
-                                      const VkVideoEncodeInfoKHR *enc_info)
-{
-   struct anv_video_session *vid = cmd->video.vid;
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv =
-      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-
-   anv_batch_emit(&cmd->batch, GENX(HCP_PIPE_BUF_ADDR_STATE), buf) {
-      buf.DecodedPictureAddress =
-         anv_image_dpb_address(base_ref_iv, base_ref_array_layer);
-
-      buf.DecodedPictureAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
-         .MOCS = anv_mocs(cmd->device, buf.DecodedPictureAddress.bo, 0),
-#if GFX_VERx10 >= 125
-         .TiledResourceMode = TRMODE_TILEF,
-#endif
-      };
-
-      ANV_VID_MEM_INIT(buf, DeblockingFilterLineBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_DEBLOCK_FILTER_ROW_STORE_LINE);
-
-      ANV_VID_MEM_INIT(buf, DeblockingFilterTileLineBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_DEBLOCK_FILTER_ROW_STORE_TILE_LINE);
-
-      ANV_VID_MEM_INIT(buf, DeblockingFilterTileColumnBuffer, cmd->device,
-                       vid,
-                       ANV_VID_MEM_H265_DEBLOCK_FILTER_ROW_STORE_TILE_COLUMN);
-
-      ANV_VID_MEM_INIT(buf, MetadataLineBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_METADATA_LINE);
-
-      ANV_VID_MEM_INIT(buf, MetadataTileLineBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_METADATA_TILE_LINE);
-
-      ANV_VID_MEM_INIT(buf, MetadataTileColumnBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_METADATA_TILE_COLUMN);
-
-      ANV_VID_MEM_INIT(buf, SAOLineBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_SAO_LINE);
-
-      ANV_VID_MEM_INIT(buf, SAOTileLineBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_SAO_TILE_LINE);
-
-      ANV_VID_MEM_INIT(buf, SAOTileColumnBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_SAO_TILE_COLUMN);
-
-      buf.CurrentMVTemporalBufferAddress =
-         anv_image_dmv_top_address(iv, enc_info->srcPictureResource.baseArrayLayer);
-
-      buf.CurrentMVTemporalBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, buf.CurrentMVTemporalBufferAddress.bo);
-
-      for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
-         const struct anv_image_view *ref_iv =
-            anv_image_view_from_handle(enc_info->pReferenceSlots[i].pPictureResource->imageViewBinding);
-
-         buf.ReferencePictureAddress[i] =
-            anv_image_dpb_address(ref_iv, enc_info->pReferenceSlots[i].pPictureResource->baseArrayLayer);
-      }
-
-      buf.ReferencePictureAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
-         .MOCS = anv_mocs(cmd->device, NULL, 0),
-#if GFX_VERx10 >= 125
-         .TiledResourceMode = TRMODE_TILEF,
-#endif
-      };
-
-      buf.OriginalUncompressedPictureSourceAddress =
-         anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer);
-      buf.OriginalUncompressedPictureSourceAddressAttributes =
-         ANV_VID_ATTR(cmd->device,
-                      buf.OriginalUncompressedPictureSourceAddress.bo);
-
-      ANV_VID_MEM_INIT(buf, StreamOutDataDestination, cmd->device, vid,
-                       ANV_VID_MEM_H265_PAK_STREAMOUT);
-      ANV_VID_MEM_INIT(buf, DecodedPictureStatusBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_LCU_BASE_ADDR);
-      ANV_VID_MEM_INIT(buf, LCUILDBStreamOutBuffer, cmd->device, vid,
-                       ANV_VID_MEM_H265_LCU_ILDB_STREAMOUT);
-
-      for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
-         const struct anv_image_view *ref_iv =
-            anv_image_view_from_handle(enc_info->pReferenceSlots[i].pPictureResource->imageViewBinding);
-
-         buf.CollocatedMVTemporalBufferAddress[i] =
-            anv_image_dmv_top_address(ref_iv, enc_info->pReferenceSlots[i].pPictureResource->baseArrayLayer);
-      }
-
-      buf.CollocatedMVTemporalBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device,
-                      buf.CollocatedMVTemporalBufferAddress[0].bo);
-
-      buf.VP9ProbabilityBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-
-      buf.VP9SegmentIDBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-
-      buf.VP9HVDLineRowStoreBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-
-      buf.VP9HVDTileRowStoreBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-
-      buf.SAOStreamOutDataDestinationBufferBaseAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_SAO_STREAMOUT);
-      buf.SAOStreamOutDataDestinationBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device,
-                      buf.SAOStreamOutDataDestinationBufferBaseAddress.bo);
-      buf.FrameStatisticsStreamOutDataDestinationBufferBaseAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_FRAME_STATS_STREAMOUT);
-      buf.FrameStatisticsStreamOutDataDestinationBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device,
-                      buf.FrameStatisticsStreamOutDataDestinationBufferBaseAddress.bo);
-
-      buf.SSESourcePixelRowStoreBufferBaseAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_SSE_SRC_PIX_ROW_STORE);
-
-      buf.SSESourcePixelRowStoreBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device,
-                      buf.SSESourcePixelRowStoreBufferBaseAddress.bo);
-
-      buf.HCPScalabilitySliceStateBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      buf.HCPScalabilityCABACDecodedSyntaxElementsBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      buf.MVUpperRightColumnStoreBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      buf.IntraPredictionUpperRightColumnStoreBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      buf.IntraPredictionLeftReconColumnStoreBufferAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-   }
-}
-
-static void
-anv_h265_emit_hcp_ind_obj_base_addr_state(struct anv_cmd_buffer *cmd,
-                                          const VkVideoEncodeInfoKHR *enc_info)
-{
-   ANV_FROM_HANDLE(anv_buffer, dst_buffer, enc_info->dstBuffer);
-   struct anv_video_session *vid = cmd->video.vid;
-
-   anv_batch_emit(&cmd->batch, GENX(HCP_IND_OBJ_BASE_ADDR_STATE), indirect) {
-      indirect.HCPIndirectBitstreamObjectAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-
-      indirect.HCPIndirectCUObjectBaseAddress =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_MB_CODE);
-      indirect.HCPIndirectCUObjectAddressAttributes =
-         ANV_VID_ATTR(cmd->device, indirect.HCPIndirectCUObjectBaseAddress.bo);
-
-      indirect.HCPPAKBSEObjectBaseAddress =
-            anv_address_add(dst_buffer->address, align(enc_info->dstBufferOffset, 4096));
-      indirect.HCPPAKBSEObjectAddressAttributes =
-         ANV_VID_ATTR(cmd->device, indirect.HCPPAKBSEObjectBaseAddress.bo);
-
-      indirect.HCPVP9PAKCompressedHeaderSyntaxStreamInAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      indirect.HCPVP9PAKProbabilityCounterStreamOutAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      indirect.HCPVP9PAKProbabilityDeltasStreamInAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      indirect.HCPVP9PAKTileRecordStreamOutAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-      indirect.HCPVP9PAKCULevelStatisticStreamOutAddressAttributes =
-         ANV_VID_ATTR(cmd->device, NULL);
-   }
-}
-
-static void
-anv_h265_emit_hcp_fqm_state(struct anv_cmd_buffer *cmd,
-                            const VkVideoEncodeInfoKHR *enc_info)
-{
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const StdVideoH265PictureParameterSet *pps = anv_h265_pps(cmd, enc_info);
-
-   if (sps->flags.scaling_list_enabled_flag) {
-      assert(0);
-      /* FIXME */
-      if (pps->flags.pps_scaling_list_data_present_flag) {
-         scaling_list(cmd, pps->pScalingLists);
-      } else if (sps->flags.sps_scaling_list_data_present_flag) {
-         scaling_list(cmd, sps->pScalingLists);
-      }
-   } else {
-      for (uint8_t size = 0; size < 4; size++) {
-         for (uint8_t pred = 0; pred < 2; pred++) {
-            anv_batch_emit(&cmd->batch, GENX(HCP_FQM_STATE), fqm) {
-               fqm.SizeID = size;
-               fqm.IntraInter = pred;
-               fqm.ColorComponent = 0;
-               fqm.FQMDCValue = size < 2 ? 0 : 0x1000;
-
-               unsigned len = (size == 0) ? 32 : 128;
-
-               for (uint8_t q = 0; q < len; q++) {
-                  fqm.QuantizerMatrix8x8[q] = q % 2 == 0 ? 0 : 0x10;
-               }
-            }
-         }
-      }
-   }
-}
-
-static void
-anv_h265_emit_hcp_qm_state(struct anv_cmd_buffer *cmd,
-                           const VkVideoEncodeInfoKHR *enc_info)
-{
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const StdVideoH265PictureParameterSet *pps = anv_h265_pps(cmd, enc_info);
-
-   if (sps->flags.scaling_list_enabled_flag) {
-      assert(0);
-      /* FIXME */
-      if (pps->flags.pps_scaling_list_data_present_flag) {
-         scaling_list(cmd, pps->pScalingLists);
-      } else if (sps->flags.sps_scaling_list_data_present_flag) {
-         scaling_list(cmd, sps->pScalingLists);
-      }
-   } else {
-      for (uint8_t size = 0; size < 4; size++) {
-         for (uint8_t pred = 0; pred < 2; pred++) {
-            for (uint8_t color = 0; color < 3; color++) {
-
-               if (size == 3 && color > 0)
-                  continue;
-
-               anv_batch_emit(&cmd->batch, GENX(HCP_QM_STATE), qm) {
-                  qm.SizeID = size;
-                  qm.PredictionType = pred;
-                  qm.ColorComponent = color;
-                  qm.DCCoefficient = (size > 1) ? 16 : 0;
-                  unsigned len = (size == 0) ? 16 : 64;
-
-                  for (uint8_t q = 0; q < len; q++)
-                     qm.QuantizerMatrix8x8[q] = 0x10;
-               }
-            }
-         }
-      }
-   }
-}
-
-static void
-anv_h265_emit_vdenc_pipe_mode_select(struct anv_cmd_buffer *cmd,
-                                     const VkVideoEncodeInfoKHR *enc_info,
-                                     bool brc_enabled,
-                                     bool pak_only,
-                                     bool is_low_delay)
-{
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const bool is_10bit = anv_h265_is_10bit(sps);
-
-   /* Xe2 HEVC P frames walk the 4x/8x downscaled references even when HME
-    * prefetch is off, so the surfaces must be written on I frames and
-    * prefetched on P frames.
-    */
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv =
-      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-   const bool has_ds = anv_image_has_vdenc_ds(base_ref_iv->image);
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_MODE_SELECT), vdenc_pipe_mode) {
-      vdenc_pipe_mode.StandardSelect = SS_HEVC;
-      vdenc_pipe_mode.FrameStatisticsStreamOutEnable = brc_enabled;
-      vdenc_pipe_mode.VDEncPAK_OBJ_CMDStreamOutEnable = brc_enabled && !pak_only;
-      vdenc_pipe_mode.BitDepth = is_10bit ? 2 : 0;
-      vdenc_pipe_mode.PAKChromaSubSamplingType = _420;
-      vdenc_pipe_mode.OutputRangeControlAfterColorSpaceConversion = true;
-      vdenc_pipe_mode.IsRandomAccess = !is_low_delay;
-      vdenc_pipe_mode.DownScaled8xWriteDisable = !has_ds;
-      vdenc_pipe_mode.DownScaled4xWriteDisable = !has_ds;
-      vdenc_pipe_mode.HMERegionPrefetchEnable = has_ds;
-      vdenc_pipe_mode.TopPrefetchEnableMode = 0;
-      vdenc_pipe_mode.LeftPrefetchAtWrapAround = true;
-      vdenc_pipe_mode.VerticalShift32Minus1 = 2;
-      vdenc_pipe_mode.HzShift32Minus1 = 3;
-      vdenc_pipe_mode.NumberofVerticalRequests = 6;
-      vdenc_pipe_mode.NumberofHorizontalRequests = 2;
-
-      vdenc_pipe_mode.SourceLumaPackedDataTLBPrefetchEnable = true;
-      vdenc_pipe_mode.SourceChromaTLBPrefetchEnable = true;
-      vdenc_pipe_mode.HzShift32Minus1Src = 3;
-      vdenc_pipe_mode.PrefetchOffsetforSource = 4;
-      vdenc_pipe_mode.VDENCPipeModeSelectPar0 = true;
-   }
-}
-
-static void
-anv_h265_emit_vdenc_src_surface_state(struct anv_cmd_buffer *cmd,
-                                      const VkVideoEncodeInfoKHR *enc_info)
-{
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const bool is_10bit = anv_h265_is_10bit(sps);
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-   const struct anv_image *src_img = iv->image;
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_SRC_SURFACE_STATE), vdenc_surface) {
-      vdenc_surface.SurfaceState =
-         anv_vdenc_surface_state(src_img, enc_info->srcPictureResource.codedExtent.width,
-                                 enc_info->srcPictureResource.codedExtent.height, is_10bit);
-   }
-}
-
-static void
-anv_h265_emit_vdenc_ref_surface_state(struct anv_cmd_buffer *cmd,
-                                      const VkVideoEncodeInfoKHR *enc_info)
-{
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const bool is_10bit = anv_h265_is_10bit(sps);
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv =
-      anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-   const struct anv_image *base_ref_img = base_ref_iv->image;
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_REF_SURFACE_STATE), vdenc_surface) {
-      vdenc_surface.SurfaceState =
-         anv_vdenc_surface_state(base_ref_img, base_ref_img->vk.extent.width,
-                                 base_ref_img->vk.extent.height, is_10bit);
-      if (is_10bit)
-         vdenc_surface.SurfaceState.SurfaceFormat = VDENC_P010_VARIANT;
-   }
-}
-
-static void
-anv_h265_emit_vdenc_ds_ref_surface_state(struct anv_cmd_buffer *cmd,
-                                         const VkVideoEncodeInfoKHR *enc_info)
-{
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv = anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-   const struct anv_image *base_ref_img = base_ref_iv->image;
-
-   anv_vdenc_emit_ds_ref_surface_state(cmd,
-      anv_video_get_enc_ds_layout(base_ref_img->vk.extent.width,
-                                  base_ref_img->vk.extent.height), true);
-}
-
-static void
-anv_h265_emit_vdenc_pipe_buf_addr_state(struct anv_cmd_buffer *cmd,
-                                        const VkVideoEncodeInfoKHR *enc_info,
-                                        bool is_low_delay)
-{
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
-   StdVideoEncodeH265ReferenceListsInfo* ref_lists =
-      (struct StdVideoEncodeH265ReferenceListsInfo *)frame_info->pStdPictureInfo->pRefLists;
-   struct anv_video_session *vid = cmd->video.vid;
-   const struct anv_image_view *iv =
-      anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
-   uint32_t base_ref_array_layer;
-   const struct anv_image_view *base_ref_iv = anv_video_enc_base_ref(enc_info, &base_ref_array_layer);
-
-   struct anv_vdenc_pipe_buf buf = {
-      .src = anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer),
-      .row_store = ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_VDENC_INTRA_ROW_STORE),
-      .scaled_8x = anv_image_ds_8x_address(base_ref_iv, base_ref_array_layer),
-      .scaled_4x = anv_image_ds_4x_address(base_ref_iv, base_ref_array_layer),
-      .stats = ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_VDENC_STATS_STREAMOUT),
-      .pak_obj = ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_MB_CODE),
-      .tile_row_store = ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_VDENC_TILE_ROW_STORE),
-      .cu_count = ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_H265_VDENC_CU_COUNT_STREAMOUT),
+   pic->Address = addr;
+   pic->PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+      .MOCS = anv_mocs(cmd->device, addr.bo, 0),
    };
-
-   /* TODO. add DSFWDREF and FWDREF */
-   const struct anv_image_view *ref_iv[3] = { 0, };
-   const struct anv_image_view *bwd_ref_iv = NULL;
-   uint32_t ref_layer[3] = { 0, };
-   uint32_t bwd_ref_layer = 0;
-
-   if (ref_lists) {
-      for (unsigned i = 0; i < ref_lists->num_ref_idx_l0_active_minus1 + 1 && i < 3; i++) {
-         const VkVideoReferenceSlotInfoKHR *slot =
-            anv_h265_find_ref_slot(enc_info, ref_lists->RefPicList0[i]);
-
-         if (!slot)
-            continue;
-
-         ref_iv[i] = anv_image_view_from_handle(slot->pPictureResource->imageViewBinding);
-         ref_layer[i] = slot->pPictureResource->baseArrayLayer;
-      }
-
-      if (!is_low_delay) {
-         const VkVideoReferenceSlotInfoKHR *slot =
-            anv_h265_find_ref_slot(enc_info, ref_lists->RefPicList1[0]);
-
-         if (slot) {
-            bwd_ref_iv = anv_image_view_from_handle(slot->pPictureResource->imageViewBinding);
-            bwd_ref_layer = slot->pPictureResource->baseArrayLayer;
-         }
-      }
-   }
-
-   if (ref_iv[0]) {
-      buf.col_mv_read =
-            anv_image_dmv_top_address(ref_iv[0], ref_layer[0]);
-      buf.fwd_ref[0] =
-            anv_image_dpb_address(ref_iv[0], ref_layer[0]);
-   }
-
-   if (ref_iv[1])
-      buf.fwd_ref[1] =
-            anv_image_dpb_address(ref_iv[1], ref_layer[1]);
-
-   if (ref_iv[2])
-      buf.fwd_ref[2] =
-            anv_image_dpb_address(ref_iv[2], ref_layer[2]);
-
-   if (bwd_ref_iv)
-      buf.bwd_ref =
-            anv_image_dpb_address(bwd_ref_iv, bwd_ref_layer);
-
-#if GFX_VERx10 >= 125
-   const struct anv_image_view *ds_ref_iv[2] = { ref_iv[0], ref_iv[1] };
-   uint32_t ds_ref_layer[2] = { ref_layer[0], ref_layer[1] };
-#else
-   const struct anv_image_view *ds_ref_iv[2] = {
-      ref_iv[0],
-      bwd_ref_iv ? bwd_ref_iv : ref_iv[1],
-   };
-   uint32_t ds_ref_layer[2] = {
-      ref_layer[0],
-      bwd_ref_iv ? bwd_ref_layer : ref_layer[1],
-   };
-#endif
-
-   for (unsigned i = 0; i < 2; i++) {
-      if (!ds_ref_iv[i])
-         continue;
-
-      buf.ds_fwd_ref[i] = anv_image_ds_8x_address(ds_ref_iv[i], ds_ref_layer[i]);
-      buf.ds_fwd_ref_4x[i] = anv_image_ds_4x_address(ds_ref_iv[i], ds_ref_layer[i]);
-   }
-
-#if GFX_VERx10 >= 125
-   if (bwd_ref_iv) {
-      buf.ds_bwd_ref = anv_image_ds_8x_address(bwd_ref_iv, bwd_ref_layer);
-      buf.ds_bwd_ref_4x = anv_image_ds_4x_address(bwd_ref_iv, bwd_ref_layer);
-   }
-#endif
-
-   anv_vdenc_emit_pipe_buf_addr_state(cmd, &buf);
 }
-
-static void
-anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
-                         struct anv_batch *batch,
-                         const VkVideoEncodeInfoKHR *enc_info)
-{
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info =
-      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
-   struct vk_video_session_parameters *params = cmd->video.params;
-   const StdVideoH265SequenceParameterSet *sps =
-      vk_video_find_h265_enc_std_sps(params, frame_info->pStdPictureInfo->pps_seq_parameter_set_id);
-   const StdVideoH265PictureParameterSet *pps =
-      vk_video_find_h265_enc_std_pps(params, frame_info->pStdPictureInfo->pps_pic_parameter_set_id);
-   const bool is_10bit = (sps->bit_depth_luma_minus8 == 2) || (sps->bit_depth_chroma_minus8 == 2);
-   bool rc_disable = cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
-   int32_t frame_qp = rc_disable ?
-      frame_info->pNaluSliceSegmentEntries[0].constantQp :
-      pps->init_qp_minus26 + 26;
-   frame_qp = CLAMP(frame_qp, 10, 51);
-
-   if (!batch)
-      batch = &cmd->batch;
-
-#if GFX_VERx10 >= 125
-   bool is_intra =
-      anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0;
-
-   /* TODO: handling low-delay / B-GOP weights for P/B frames. */
-   double weight = is_intra ? 0.60 : 0.65;
-   double num = weight * hevc_vdenc_cmd1_qp_scale[frame_qp - 1];
-   uint32_t par0 = MIN2(65535u, (uint32_t)(num * 4 + 0.5));
-   uint32_t par1 = MIN2(65535u, (uint32_t)(sqrt(num) * 4 + 0.5));
-
-   static const uint8_t par2[8]  = { 0, 2, 3, 5, 6, 8, 9, 11 };
-   static const uint8_t par3[12] = { 4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92 };
-
-   /* v[i] is dword i + 1 of the command, the layout follows media-driver's
-    * VDENC_CMD1 par -> dword mapping (mhw_vdbox_vdenc_impl.h).
-    */
-   uint32_t v[GENX(VDENC_CMD1_length) - 1] = { 0 };
-   for (unsigned i = 0; i < 8; i++)
-      v[i / 4] |= (uint32_t)par2[i] << (8 * (i % 4));
-   for (unsigned i = 0; i < 12; i++) {
-      v[2 + i / 4] |= (uint32_t)par3[i] << (8 * (i % 4));
-      v[5 + i / 4] |= (uint32_t)par3[i] << (8 * (i % 4));
-   }
-   v[12] = 4u << 16;
-   v[15] = (uint32_t)(is_intra ? 21 : 7) << 16 | (uint32_t)(is_intra ? 0 : 4) << 24;
-   v[18] = 20u << 16;
-   v[19] = v[20] = 0x0c0c0c0c;
-   v[21] = par0 | par1 << 16;
-   for (unsigned i = 22; i <= 29; i++)
-      v[i] = 0x10101010;
-   v[30] = (uint32_t)(is_intra ? 16 : 20) |
-           (uint32_t)(is_intra ? 16 : 20) << 8 |
-           (uint32_t)(is_intra ? 47 : 20) << 16;
-
-#if GFX_VER >= 20
-   /* Xe2 HPG (BMG) tuning on top of the common settings, from media-driver
-    * encode_hevc_vdenc_const_settings_xe2_hpm.cpp for target usage 4. The
-    * command grows to 39 dwords, dwords 33-38 hold the remaining entries of
-    * the par8-par15 arrays (mhw_vdbox_vdenc_impl_xe2_hpm.h).
-    */
-   static const uint8_t xe2_par8_15[8][4] = {
-      { 11, 14, 15, 17 }, /* par8 */
-      { 14, 17, 18, 19 }, /* par9 */
-      { 14, 17, 18, 19 }, /* par10 */
-      { 20, 23, 24, 25 }, /* par11 */
-      { 23, 26, 27, 29 }, /* par12 */
-      { 26, 29, 30, 31 }, /* par13 */
-      { 26, 29, 30, 31 }, /* par14 */
-      { 38, 41, 42, 43 }, /* par15 */
-   };
-#define PAR(n, i) ((uint32_t)xe2_par8_15[(n) - 8][i])
-   v[9]  = PAR(8, 0)  | PAR(12, 0) << 8 | PAR(9, 0)  << 16 | PAR(13, 0) << 24;
-   v[10] = PAR(10, 0) | PAR(14, 0) << 8 | PAR(11, 0) << 16 | PAR(15, 0) << 24;
-   v[32] = PAR(11, 1) | PAR(15, 3) << 8 | PAR(15, 2) << 16 | PAR(15, 1) << 24;
-   v[33] = PAR(14, 2) | PAR(14, 1) << 8 | PAR(11, 3) << 16 | PAR(11, 2) << 24;
-   v[34] = PAR(10, 3) | PAR(10, 2) << 8 | PAR(10, 1) << 16 | PAR(14, 3) << 24;
-   v[35] = PAR(9, 1)  | PAR(13, 3) << 8 | PAR(13, 2) << 16 | PAR(13, 1) << 24;
-   v[36] = PAR(12, 2) | PAR(12, 1) << 8 | PAR(9, 3)  << 16 | PAR(9, 2)  << 24;
-   v[37] = PAR(8, 3)  | PAR(8, 2)  << 8 | PAR(8, 1)  << 16 | PAR(12, 3) << 24;
-#undef PAR
-
-   /* par16-par21 and par23 */
-   v[11] = is_intra ? (92u | 23u << 8 | 92u << 16 | 21u << 24) :
-                      (110u | 26u << 8 | 110u << 16 | 24u << 24);
-   v[12] |= is_intra ? (23u | 42u << 24) : (26u | 54u << 24);
-   /* par36-par41, no ROI */
-   v[16] = is_intra ? (21u | 47u << 8 | 16u << 16 | 16u << 24) :
-                      (7u | 20u << 8 | 20u << 16 | 20u << 24);
-   v[17] = is_intra ? (30u | 30u << 8) : (30u | 68u << 8);
-   /* par95 */
-   v[8] |= 50u << 24;
 #endif
 
-   anv_batch_emit(batch, GENX(VDENC_CMD1), cmd1) {
-      for (unsigned i = 0; i < ARRAY_SIZE(v); i++)
-         cmd1.Values[i] = v[i];
-   }
-#else
-   anv_batch_emit(batch, GENX(VDENC_CMD1), cmd1) {
-      /* Magic numbers taken from media-driver */
-      cmd1.Values[0] = 0x5030200;
-      cmd1.Values[1] = 0xb090806;
-      cmd1.Values[2] = 0x1c140c04;
-      cmd1.Values[3] = 0x3c342c24;
-      cmd1.Values[4] = 0x5c544c44;
-      cmd1.Values[5] = 0x1c140c04;
-      cmd1.Values[6] = 0x3c342c24;
-      cmd1.Values[7] = 0x5c544c44;
-      cmd1.Values[13] = 0x0;
-      cmd1.Values[14] = 0x0;
-      cmd1.Values[15] &= 0xffff0000;
-
-      cmd1.Values[18] = (cmd1.Values[18] & 0xff0000ff) | 0x140400;
-      cmd1.Values[19] = 0x14141414;
-      cmd1.Values[20] = 0x14141414;
-
-      cmd1.Values[21] = 0x10101010;
-      cmd1.Values[22] = 0x10101010;
-      cmd1.Values[23] = 0x10101010;
-      cmd1.Values[24] = 0x10101010;
-      cmd1.Values[25] = 0x10101010;
-      cmd1.Values[26] = 0x10101010;
-      cmd1.Values[27] = 0x10101010;
-      cmd1.Values[28] = 0x10101010;
-
-      if (anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0) {
-         cmd1.Values[9] = 0x23131f0f;
-         cmd1.Values[10] = (cmd1.Values[10] & 0xffff0000) | 0x2313;
-         cmd1.Values[11] = 0x3e5c445c;
-         cmd1.Values[12] = (cmd1.Values[12] & 0xff00) | 0x1e040044;
-         cmd1.Values[15] = (cmd1.Values[15] & 0xffff) | 0x70000;
-         cmd1.Values[16] = 0xd0e1007;
-         cmd1.Values[17] = (cmd1.Values[17] & 0xffffff00) | 0x32;
-         /* Handle Number of ROI */
-         cmd1.Values[17] = (cmd1.Values[17] & 0xffff00ff) | 0x1e00;
-         cmd1.Values[29] = (cmd1.Values[29] & 0xff000000) | 0x101010;
-      } else {
-         cmd1.Values[9] = 0x23131f0f;
-         cmd1.Values[10] = 0x331b2313;
-         cmd1.Values[11] = 0x476e4d6e;
-         cmd1.Values[12] = 0x3604004d;
-         cmd1.Values[15] = (cmd1.Values[15] & 0xffff) | 0x4150000;
-         cmd1.Values[16] = 0x23231415;
-         cmd1.Values[17] = (cmd1.Values[17] & 0xffffff00) | 0x3f;
-         /* Handle Number of ROI */
-         cmd1.Values[17] = (cmd1.Values[17] & 0xffff00ff) | 0x4400;
-         cmd1.Values[29] = (cmd1.Values[29] & 0xff000000) | 0x232323;
-      }
-   }
-#endif
-}
-
+#if GFX_VER >= 12
 static void
 anv_h265_emit_hcp_pic_state(struct anv_cmd_buffer *cmd,
                             struct anv_batch *batch,
@@ -2950,6 +2097,9 @@ anv_h265_emit_hcp_pic_state(struct anv_cmd_buffer *cmd,
 
 }
 
+#endif
+
+#if GFX_VER >= 12
 /* VkVideoEncodeH265PictureInfoKHR::pStdPictureInfo->pRefLists is optional;
  * Vulkan allows it to be NULL.  Use an empty list so the command stream code
  * never dereferences a NULL pointer.
@@ -3088,9 +2238,7 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
                ref_idx[i] = dpb_idx[slot];
                if (i < 3) {
                   bool lt = false;
-                  int32_t rp = 0;
-                  anv_h265_get_ref_poc(enc_info, slot, &rp, &lt);
-                  poc_l0[i] = rp;
+                  poc_l0[i] = anv_h265_get_ref_poc(enc_info, slot, &lt);
                }
             }
          }
@@ -3105,9 +2253,7 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
             if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE) {
                ref_idx[l1_entry] = dpb_idx[slot];
                bool lt = false;
-               int32_t rp = 0;
-               anv_h265_get_ref_poc(enc_info, slot, &rp, &lt);
-               poc_l1[0] = rp;
+               poc_l1[0] = anv_h265_get_ref_poc(enc_info, slot, &lt);
             }
          } else {
             /* Low delay: the L1 slot carries the current POC. */
@@ -3125,20 +2271,16 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
          for (unsigned i = 0; i < 3 && i < ref_lists->num_ref_idx_l0_active_minus1 + 1; i++) {
             uint8_t slot = ref_lists->RefPicList0[i];
             bool lt = false;
-            if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE) {
-               int32_t rp = 0;
-               anv_h265_get_ref_poc(enc_info, slot, &rp, &lt);
-            }
+            if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE)
+               anv_h265_get_ref_poc(enc_info, slot, &lt);
             if (lt)
                lt_l0 |= 1u << i;
          }
          for (unsigned i = 0; i < 3 && i < ref_lists->num_ref_idx_l1_active_minus1 + 1; i++) {
             uint8_t slot = ref_lists->RefPicList1[i];
             bool lt = false;
-            if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE) {
-               int32_t rp = 0;
-               anv_h265_get_ref_poc(enc_info, slot, &rp, &lt);
-            }
+            if (slot != STD_VIDEO_H265_NO_REFERENCE_PICTURE)
+               anv_h265_get_ref_poc(enc_info, slot, &lt);
             if (lt)
                lt_l1 |= 1u << i;
          }
@@ -3310,8 +2452,9 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
          int32_t poc_l0[3] = { 0, };
          for (unsigned i = 0; i <= ref_lists->num_ref_idx_l0_active_minus1 && i < 3; i++) {
             bool long_term;
-            int32_t ref_poc = 0;
-            anv_h265_get_ref_poc(enc_info, ref_lists->RefPicList0[i], &ref_poc, &long_term);
+            int32_t ref_poc = anv_h265_get_ref_poc(enc_info,
+                                                 ref_lists->RefPicList0[i],
+                                                 &long_term);
             int64_t diff_poc = (int64_t)pic_info.PicOrderCntVal - ref_poc;
             poc_l0[i] = CLAMP(diff_poc, -16, 16);
             cmd2.LongTermReferenceFlagsL0 |= (uint32_t)long_term << i;
@@ -3323,8 +2466,7 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
          bool long_term;
          uint8_t ref_slot = is_p_frame ? ref_lists->RefPicList0[0] :
                                         ref_lists->RefPicList1[0];
-         int32_t ref_poc = 0;
-         anv_h265_get_ref_poc(enc_info, ref_slot, &ref_poc, &long_term);
+         int32_t ref_poc = anv_h265_get_ref_poc(enc_info, ref_slot, &long_term);
          int64_t diff_poc = (int64_t)pic_info.PicOrderCntVal - ref_poc;
          cmd2.POCNumberForRefid0InL1 = CLAMP(diff_poc, -16, 16);
          cmd2.LongTermReferenceFlagsL1 = long_term;
@@ -3382,69 +2524,328 @@ anv_h265_emit_vdenc_cmd2(struct anv_cmd_buffer *cmd,
       }
    }
 }
+#endif
 
+#if GFX_VER >= 12
 static void
-anv_h265_emit_hcp_ref_idx_state(struct anv_cmd_buffer *cmd,
-                                const VkVideoEncodeInfoKHR *enc_info,
-                                uint32_t slice_id,
-                                const uint8_t *dpb_idx)
+anv_h265_emit_vdenc_cmd1(struct anv_cmd_buffer *cmd,
+                         struct anv_batch *batch,
+                         const VkVideoEncodeInfoKHR *enc_info)
 {
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
-   StdVideoEncodeH265ReferenceListsInfo* ref_lists =
-      (struct StdVideoEncodeH265ReferenceListsInfo *)frame_info->pStdPictureInfo->pRefLists;
-   const VkVideoEncodeH265NaluSliceSegmentInfoKHR *nalu =
-      &frame_info->pNaluSliceSegmentEntries[slice_id];
-   const StdVideoEncodeH265SliceSegmentHeader *slice_header = nalu->pStdSliceSegmentHeader;
-   uint32_t slice_type = slice_header->slice_type % 5;
+   const struct VkVideoEncodeH265PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
+   struct vk_video_session_parameters *params = cmd->video.params;
+   const StdVideoH265SequenceParameterSet *sps =
+      vk_video_find_h265_enc_std_sps(params, frame_info->pStdPictureInfo->pps_seq_parameter_set_id);
+   const StdVideoH265PictureParameterSet *pps =
+      vk_video_find_h265_enc_std_pps(params, frame_info->pStdPictureInfo->pps_pic_parameter_set_id);
+   const bool is_10bit = (sps->bit_depth_luma_minus8 == 2) || (sps->bit_depth_chroma_minus8 == 2);
+   bool rc_disable = cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+   int32_t frame_qp = rc_disable ?
+      frame_info->pNaluSliceSegmentEntries[0].constantQp :
+      pps->init_qp_minus26 + 26;
+   frame_qp = CLAMP(frame_qp, 10, 51);
 
-   if (slice_type != STD_VIDEO_H265_SLICE_TYPE_I) {
-      anv_batch_emit(&cmd->batch, GENX(HCP_REF_IDX_STATE), ref) {
-         ref.ReferencePictureListSelect = 0;
-         ref.NumberofReferenceIndexesActive = ref_lists->num_ref_idx_l0_active_minus1;
+   if (!batch)
+      batch = &cmd->batch;
 
-         for (uint32_t i = 0; i < ref_lists->num_ref_idx_l0_active_minus1 + 1; i++) {
-            uint8_t slot = ref_lists->RefPicList0[i];
-            bool long_term = false;
+#if GFX_VERx10 >= 125
+   bool is_intra =
+      anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0;
 
-            if (slot == STD_VIDEO_H265_NO_REFERENCE_PICTURE)
-               continue;
+   /* TODO: handling low-delay / B-GOP weights for P/B frames. */
+   double weight = is_intra ? 0.60 : 0.65;
+   double num = weight * hevc_vdenc_cmd1_qp_scale[frame_qp - 1];
+   uint32_t par0 = MIN2(65535u, (uint32_t)(num * 4 + 0.5));
+   uint32_t par1 = MIN2(65535u, (uint32_t)(sqrt(num) * 4 + 0.5));
 
-            int32_t ref_poc;
-            bool found = anv_h265_get_ref_poc(enc_info, slot, &ref_poc, &long_term);
-            assert(found);
-            int32_t diff_poc = frame_info->pStdPictureInfo->PicOrderCntVal - ref_poc;
+   static const uint8_t par2[8]  = { 0, 2, 3, 5, 6, 8, 9, 11 };
+   static const uint8_t par3[12] = { 4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92 };
 
-            ref.ReferenceListEntry[i].ListEntry = dpb_idx[slot];
-            ref.ReferenceListEntry[i].ReferencePicturetbValue = CLAMP(diff_poc, -128, 127) & 0xff;
-            ref.ReferenceListEntry[i].LongTermReference = long_term;
-            ref.ReferenceListEntry[i].TopField = true;
-         }
+   /* v[i] is dword i + 1 of the command, the layout follows media-driver's
+    * VDENC_CMD1 par -> dword mapping (mhw_vdbox_vdenc_impl.h).
+    */
+   uint32_t v[GENX(VDENC_CMD1_length) - 1] = { 0 };
+   for (unsigned i = 0; i < 8; i++)
+      v[i / 4] |= (uint32_t)par2[i] << (8 * (i % 4));
+   for (unsigned i = 0; i < 12; i++) {
+      v[2 + i / 4] |= (uint32_t)par3[i] << (8 * (i % 4));
+      v[5 + i / 4] |= (uint32_t)par3[i] << (8 * (i % 4));
+   }
+   v[12] = 4u << 16;
+   v[15] = (uint32_t)(is_intra ? 21 : 7) << 16 | (uint32_t)(is_intra ? 0 : 4) << 24;
+   v[18] = 20u << 16;
+   v[19] = v[20] = 0x0c0c0c0c;
+   v[21] = par0 | par1 << 16;
+   for (unsigned i = 22; i <= 29; i++)
+      v[i] = 0x10101010;
+   v[30] = (uint32_t)(is_intra ? 16 : 20) |
+           (uint32_t)(is_intra ? 16 : 20) << 8 |
+           (uint32_t)(is_intra ? 47 : 20) << 16;
+
+#if GFX_VER >= 20
+   /* Xe2 HPG (BMG) tuning on top of the common settings, from media-driver
+    * encode_hevc_vdenc_const_settings_xe2_hpm.cpp for target usage 4. The
+    * command grows to 39 dwords, dwords 33-38 hold the remaining entries of
+    * the par8-par15 arrays (mhw_vdbox_vdenc_impl_xe2_hpm.h).
+    */
+   static const uint8_t xe2_par8_15[8][4] = {
+      { 11, 14, 15, 17 }, /* par8 */
+      { 14, 17, 18, 19 }, /* par9 */
+      { 14, 17, 18, 19 }, /* par10 */
+      { 20, 23, 24, 25 }, /* par11 */
+      { 23, 26, 27, 29 }, /* par12 */
+      { 26, 29, 30, 31 }, /* par13 */
+      { 26, 29, 30, 31 }, /* par14 */
+      { 38, 41, 42, 43 }, /* par15 */
+   };
+#define PAR(n, i) ((uint32_t)xe2_par8_15[(n) - 8][i])
+   v[9]  = PAR(8, 0)  | PAR(12, 0) << 8 | PAR(9, 0)  << 16 | PAR(13, 0) << 24;
+   v[10] = PAR(10, 0) | PAR(14, 0) << 8 | PAR(11, 0) << 16 | PAR(15, 0) << 24;
+   v[32] = PAR(11, 1) | PAR(15, 3) << 8 | PAR(15, 2) << 16 | PAR(15, 1) << 24;
+   v[33] = PAR(14, 2) | PAR(14, 1) << 8 | PAR(11, 3) << 16 | PAR(11, 2) << 24;
+   v[34] = PAR(10, 3) | PAR(10, 2) << 8 | PAR(10, 1) << 16 | PAR(14, 3) << 24;
+   v[35] = PAR(9, 1)  | PAR(13, 3) << 8 | PAR(13, 2) << 16 | PAR(13, 1) << 24;
+   v[36] = PAR(12, 2) | PAR(12, 1) << 8 | PAR(9, 3)  << 16 | PAR(9, 2)  << 24;
+   v[37] = PAR(8, 3)  | PAR(8, 2)  << 8 | PAR(8, 1)  << 16 | PAR(12, 3) << 24;
+#undef PAR
+
+   /* par16-par21 and par23 */
+   v[11] = is_intra ? (92u | 23u << 8 | 92u << 16 | 21u << 24) :
+                      (110u | 26u << 8 | 110u << 16 | 24u << 24);
+   v[12] |= is_intra ? (23u | 42u << 24) : (26u | 54u << 24);
+   /* par36-par41, no ROI */
+   v[16] = is_intra ? (21u | 47u << 8 | 16u << 16 | 16u << 24) :
+                      (7u | 20u << 8 | 20u << 16 | 20u << 24);
+   v[17] = is_intra ? (30u | 30u << 8) : (30u | 68u << 8);
+   /* par95 */
+   v[8] |= 50u << 24;
+#endif
+
+   anv_batch_emit(batch, GENX(VDENC_CMD1), cmd1) {
+      for (unsigned i = 0; i < ARRAY_SIZE(v); i++)
+         cmd1.Values[i] = v[i];
+   }
+#else
+   anv_batch_emit(batch, GENX(VDENC_CMD1), cmd1) {
+      /* Magic numbers taken from media-driver */
+      cmd1.Values[0] = 0x5030200;
+      cmd1.Values[1] = 0xb090806;
+      cmd1.Values[2] = 0x1c140c04;
+      cmd1.Values[3] = 0x3c342c24;
+      cmd1.Values[4] = 0x5c544c44;
+      cmd1.Values[5] = 0x1c140c04;
+      cmd1.Values[6] = 0x3c342c24;
+      cmd1.Values[7] = 0x5c544c44;
+      cmd1.Values[13] = 0x0;
+      cmd1.Values[14] = 0x0;
+      cmd1.Values[15] &= 0xffff0000;
+
+      cmd1.Values[18] = (cmd1.Values[18] & 0xff0000ff) | 0x140400;
+      cmd1.Values[19] = 0x14141414;
+      cmd1.Values[20] = 0x14141414;
+
+      cmd1.Values[21] = 0x10101010;
+      cmd1.Values[22] = 0x10101010;
+      cmd1.Values[23] = 0x10101010;
+      cmd1.Values[24] = 0x10101010;
+      cmd1.Values[25] = 0x10101010;
+      cmd1.Values[26] = 0x10101010;
+      cmd1.Values[27] = 0x10101010;
+      cmd1.Values[28] = 0x10101010;
+
+      if (anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0) {
+         cmd1.Values[9] = 0x23131f0f;
+         cmd1.Values[10] = (cmd1.Values[10] & 0xffff0000) | 0x2313;
+         cmd1.Values[11] = 0x3e5c445c;
+         cmd1.Values[12] = (cmd1.Values[12] & 0xff00) | 0x1e040044;
+         cmd1.Values[15] = (cmd1.Values[15] & 0xffff) | 0x70000;
+         cmd1.Values[16] = 0xd0e1007;
+         cmd1.Values[17] = (cmd1.Values[17] & 0xffffff00) | 0x32;
+         /* Handle Number of ROI */
+         cmd1.Values[17] = (cmd1.Values[17] & 0xffff00ff) | 0x1e00;
+         cmd1.Values[29] = (cmd1.Values[29] & 0xff000000) | 0x101010;
+      } else {
+         cmd1.Values[9] = 0x23131f0f;
+         cmd1.Values[10] = 0x331b2313;
+         cmd1.Values[11] = 0x476e4d6e;
+         cmd1.Values[12] = 0x3604004d;
+         cmd1.Values[15] = (cmd1.Values[15] & 0xffff) | 0x4150000;
+         cmd1.Values[16] = 0x23231415;
+         cmd1.Values[17] = (cmd1.Values[17] & 0xffffff00) | 0x3f;
+         /* Handle Number of ROI */
+         cmd1.Values[17] = (cmd1.Values[17] & 0xffff00ff) | 0x4400;
+         cmd1.Values[29] = (cmd1.Values[29] & 0xff000000) | 0x232323;
       }
    }
+#endif
+}
+#endif
 
-   if (slice_type == STD_VIDEO_H265_SLICE_TYPE_B) {
-      anv_batch_emit(&cmd->batch, GENX(HCP_REF_IDX_STATE), ref) {
-         ref.ReferencePictureListSelect = 1;
-         ref.NumberofReferenceIndexesActive = ref_lists->num_ref_idx_l1_active_minus1;
+#if GFX_VER >= 12
+static void
+anv_video_emit_mfx_wait(struct anv_cmd_buffer *cmd, struct anv_batch *batch)
+{
+   if (!batch)
+      batch = &cmd->batch;
 
-         for (uint32_t i = 0; i < ref_lists->num_ref_idx_l1_active_minus1 + 1; i++) {
-            uint8_t slot = ref_lists->RefPicList1[i];
-            bool long_term = false;
+   anv_batch_emit(batch, GENX(MFX_WAIT), mfx) {
+      mfx.MFXSyncControlFlag = 1;
+   }
+}
 
-            if (slot == STD_VIDEO_H265_NO_REFERENCE_PICTURE)
-               continue;
+static void
+anv_h265_emit_hcp_pipe_mode_select(struct anv_cmd_buffer *cmd,
+                                   struct anv_batch *batch,
+                                   const VkVideoEncodeInfoKHR *enc_info,
+                                   bool brc_enabled)
+{
+   if (!batch)
+      batch = &cmd->batch;
 
-            int32_t ref_poc;
-            bool found = anv_h265_get_ref_poc(enc_info, slot, &ref_poc, &long_term);
-            assert(found);
-            int32_t diff_poc = frame_info->pStdPictureInfo->PicOrderCntVal - ref_poc;
+   anv_batch_emit(batch, GENX(HCP_PIPE_MODE_SELECT), sel) {
+      sel.CodecSelect = Encode;
+      sel.CodecStandardSelect = HEVC;
+      sel.VDEncMode = VM_VDEncMode;
+      /* media-driver HevcVdencPkt: bStreamOutEnabled = true. The PAK
+       * streamout buffer is already bound in HCP_PIPE_BUF_ADDR_STATE.
+       */
+      sel.PAKPipelineStreamOutEnable = true;
+      sel.PAKFrameLevelStreamOutEnable = brc_enabled;
+      sel.AdvancedRateControlEnable = brc_enabled;
+      /* media-driver clears this bit only for the target usages that disable
+       * RDOQ; the reference BRC stream has it set (DW1 0x1e05 vs 0x1605).
+       */
+      sel.RDOQEnable = true;
+   }
+}
+#endif
 
-            ref.ReferenceListEntry[i].ListEntry = dpb_idx[slot];
-            ref.ReferenceListEntry[i].ReferencePicturetbValue = CLAMP(diff_poc, -128, 127) & 0xff;
-            ref.ReferenceListEntry[i].LongTermReference = long_term;
-            ref.ReferenceListEntry[i].TopField = true;
-         }
+static void
+anv_video_emit_mi_flush_dw(struct anv_cmd_buffer *cmd, bool cache_invalidate)
+{
+   anv_batch_emit(&cmd->batch, GENX(MI_FLUSH_DW), flush) {
+      flush.VideoPipelineCacheInvalidate = cache_invalidate;
+   }
+}
+
+static uint32_t
+anv_video_encode_quantizer(const struct anv_video_session *vid,
+                           uint32_t constant, uint32_t driver_default)
+{
+   switch (vid->rc_mode) {
+   case VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR:
+      return constant;
+   case VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR:
+   default:
+      return driver_default;
+   }
+}
+
+static const struct VkVideoEncodeH265PictureInfoKHR *
+anv_h265_frame_info(const VkVideoEncodeInfoKHR *enc_info)
+{
+   return vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
+}
+
+static const StdVideoH265VideoParameterSet *
+anv_h265_vps(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
+{
+   return vk_video_find_h265_enc_std_vps(
+            cmd->video.params,
+            anv_h265_frame_info(enc_info)->pStdPictureInfo->sps_video_parameter_set_id);
+}
+
+static const StdVideoH265SequenceParameterSet *
+anv_h265_sps(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
+{
+   return vk_video_find_h265_enc_std_sps(
+            cmd->video.params,
+            anv_h265_frame_info(enc_info)->pStdPictureInfo->pps_seq_parameter_set_id);
+}
+
+static const StdVideoH265PictureParameterSet *
+anv_h265_pps(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
+{
+   return vk_video_find_h265_enc_std_pps(
+            cmd->video.params,
+            anv_h265_frame_info(enc_info)->pStdPictureInfo->pps_pic_parameter_set_id);
+}
+
+static bool
+anv_h265_is_10bit(const StdVideoH265SequenceParameterSet *sps)
+{
+   return (sps->bit_depth_luma_minus8 == 2) || (sps->bit_depth_chroma_minus8 == 2);
+}
+
+static void
+anv_h265_frame_size(const StdVideoH265SequenceParameterSet *sps,
+                    uint32_t *width_in_pix, uint32_t *height_in_pix)
+{
+   uint32_t frame_width_in_min_cb =
+      sps->pic_width_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t frame_height_in_min_cb =
+      sps->pic_height_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+
+   *width_in_pix = frame_width_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   *height_in_pix = frame_height_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
+}
+
+static uint32_t
+anv_h265_slice_qp(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info, uint32_t slice_id)
+{
+   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
+   const StdVideoH265PictureParameterSet *pps = anv_h265_pps(cmd, enc_info);
+   const VkVideoEncodeH265NaluSliceSegmentInfoKHR *nalu = &frame_info->pNaluSliceSegmentEntries[slice_id];
+
+   return anv_video_encode_quantizer(cmd->video.vid, nalu->constantQp,
+                                     pps->init_qp_minus26 + 26);
+}
+
+static uint8_t
+anv_h265_chroma_log2_weight_denom(const StdVideoH265PictureParameterSet *pps,
+                                  const StdVideoEncodeH265SliceSegmentHeader *slice_header)
+{
+   uint32_t slice_type = slice_header->slice_type % 5;
+
+   if ((pps->flags.weighted_pred_flag && (slice_type == STD_VIDEO_H265_SLICE_TYPE_P)) ||
+         (pps->flags.weighted_bipred_flag && (slice_type == STD_VIDEO_H265_SLICE_TYPE_B))) {
+      return slice_header->pWeightTable->luma_log2_weight_denom +
+             slice_header->pWeightTable->delta_chroma_log2_weight_denom;
+   }
+
+   return 0;
+}
+
+
+
+#if GFX_VER >= 12
+static void
+anv_vdenc_emit_weightsoffsets_state(struct anv_cmd_buffer *cmd,
+                                    struct anv_batch *batch,
+                                    bool chroma)
+{
+   if (!batch)
+      batch = &cmd->batch;
+   anv_batch_emit(batch, GENX(VDENC_WEIGHTSOFFSETS_STATE), vdenc_offsets) {
+      vdenc_offsets.WeightsForwardReference0 = 1;
+      vdenc_offsets.WeightsForwardReference1 = 1;
+      vdenc_offsets.WeightsForwardReference2 = 1;
+      vdenc_offsets.HEVCVP9WeightsBackwardReference0 = 1;
+#if GFX_VERx10 >= 125
+      if (chroma) {
+         vdenc_offsets.CbWeightsForwardReference0 = 1;
+         vdenc_offsets.CbWeightsForwardReference1 = 1;
+         vdenc_offsets.CbWeightsForwardReference2 = 1;
+         vdenc_offsets.CbWeightsBackwardReference0 = 1;
+         vdenc_offsets.CrWeightsForwardReference0 = 1;
+         vdenc_offsets.CrWeightsForwardReference1 = 1;
+         vdenc_offsets.CrWeightsForwardReference2 = 1;
+         vdenc_offsets.CrWeightsBackwardReference0 = 1;
       }
+#else
+      assert(!chroma);
+#endif
    }
 }
 
@@ -3603,19 +3004,22 @@ anv_h265_emit_hcp_slice_state(struct anv_cmd_buffer *cmd,
       slice.RoundIntra = 10;
 
       {
-         /* HCP_SLICE_STATE.SliceHeaderLength holds the slice header bit
-          * length up to the byte alignment (media-driver's
-          * BitLengthSliceHeaderStartingPortion), which the PAK needs in order
-          * to place the header before the slice data. */
          uint8_t sh_data[256] = { 0, };
          size_t sh_len = 0;
-         const int8_t sh_qp_delta = (int8_t)(slice_qp - (pps->init_qp_minus26 + 26));
+         uint32_t sh_qp_delta =
+            anv_h265_slice_qp(cmd, enc_info, slice_id) - (pps->init_qp_minus26 + 26);
 
          vk_video_encode_h265_slice_header(frame_info->pStdPictureInfo,
                                            anv_h265_vps(cmd, enc_info),
-                                           sps, pps, slice_header, sh_qp_delta,
+                                           anv_h265_sps(cmd, enc_info),
+                                           anv_h265_pps(cmd, enc_info),
+                                           slice_header, sh_qp_delta,
                                            &sh_len, &sh_data);
-         slice.SliceHeaderLength = sh_len ? (uint32_t)(sh_len - 1) * 8 : 0;
+         /* media-driver programs the header bits up to the byte
+          * alignment (BitLengthSliceHeaderStartingPortion), so drop the
+          * rbsp trailing/alignment byte.
+          */
+         slice.SliceHeaderLength = sh_len ? (sh_len - 1) * 8 : 0;
       }
       slice.CABACZeroWordInsertionEnable = false;
       slice.EmulationByteSliceInsertEnable = true;
@@ -3709,142 +3113,10 @@ anv_h265_emit_slice_header(struct anv_cmd_buffer *cmd,
 
    memcpy(dw + 2, slice_header_data, length_in_dw * 4);
 }
-
-#if GFX_VERx10 >= 125
-static void
-anv_h265_emit_vdenc_tile_slice_state(struct anv_cmd_buffer *cmd,
-                                     const VkVideoEncodeInfoKHR *enc_info,
-                                     uint32_t slice_id)
-{
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   uint32_t slice_qp = anv_h265_slice_qp(cmd, enc_info, slice_id);
-   uint32_t width_in_pix, height_in_pix;
-   anv_h265_frame_size(sps, &width_in_pix, &height_in_pix);
-
-    /* TODO: Different setting according to the target usage;
-     * SCC (palette/IBC) and bit-depth > 8 adjustments;
-     * per-tile origin/size/offsets once multi-tile is supported.
-     */
-   uint32_t qp_idx = slice_qp <= 12 ? 0 : slice_qp <= 17 ? 1 : slice_qp <= 22 ? 2 :
-                     slice_qp <= 27 ? 3 : slice_qp <= 32 ? 4 : slice_qp <= 37 ? 5 :
-                     slice_qp <= 42 ? 6 : slice_qp <= 47 ? 7 : slice_qp <= 49 ? 8 : 9;
-   const uint32_t *param = h265_vdenc_hevc_tile_slice_params[1][qp_idx];
-
-   anv_batch_emit(&cmd->batch, GENX(VDENC_HEVC_VP9_TILE_SLICE_STATE), til) {
-      til.NumParEngine = 0;
-      til.TileWidth = width_in_pix - 1;
-      til.TileHeight = height_in_pix - 1;
-
-      til.TileSliceParam0  = 0;
-      til.TileSliceParam1  = param[7];
-      til.TileSliceParam2  = 0;
-      til.TileSliceParam3  = param[9];
-      til.TileSliceParam4  = param[8];
-      til.TileSliceParam5  = 1;
-      til.TileSliceParam6  = param[4];
-      til.TileSliceParam7  = param[2];
-      til.TileSliceParam8  = param[3];
-      til.TileSliceParam9  = param[1];
-      til.TileSliceParam10 = param[5];
-      til.TileSliceParam11 = 2;
-      til.TileSliceParam12 = 72;
-      til.TileSliceParam13 = 1;
-      til.TileSliceParam14 = 0;
-      til.TileSliceParam15 = param[0];
-      til.TileSliceParam16 = 63;
-      til.TileSliceParam17 = 63;
-      til.TileSliceParam18 = 63;
-      til.TileSliceParam19 = 6;
-      til.TileSliceParam20 = 0x5;
-   }
-}
 #endif
 
-static void
-anv_h265_emit_vdenc_walker_state(struct anv_cmd_buffer *cmd,
-                                 const VkVideoEncodeInfoKHR *enc_info,
-                                 uint32_t slice_id)
-{
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const VkVideoEncodeH265NaluSliceSegmentInfoKHR *nalu = &frame_info->pNaluSliceSegmentEntries[slice_id];
-   const StdVideoEncodeH265SliceSegmentHeader *slice_header = nalu->pStdSliceSegmentHeader;
-   uint32_t width_in_pix, height_in_pix;
-   anv_h265_frame_size(sps, &width_in_pix, &height_in_pix);
-   uint32_t ctb_size = 1 << (sps->log2_diff_max_min_luma_coding_block_size +
-       sps->log2_min_luma_coding_block_size_minus3 + 3);
-   uint32_t ctb_w = DIV_ROUND_UP(width_in_pix, ctb_size);
-   uint32_t ctb_h = DIV_ROUND_UP(height_in_pix, ctb_size);
 
-   anv_batch_emit(&cmd->batch, GENX(VDENC_WALKER_STATE), vdenc_walker) {
-      uint32_t slice_block_rows = DIV_ROUND_UP(height_in_pix, ANV_MAX_H265_CTB_SIZE);
-      uint32_t slice_block_cols = DIV_ROUND_UP(width_in_pix, ANV_MAX_H265_CTB_SIZE);
-      uint32_t num_ctu_in_slice = slice_block_cols * slice_block_rows;
-
-      vdenc_walker.MBLCUStartYPosition = slice_header->slice_segment_address % ctb_w;
-      vdenc_walker.NextSliceMBLCUStartXPosition =
-         (slice_header->slice_segment_address + num_ctu_in_slice) / ctb_h;
-      vdenc_walker.NextSliceMBStartYPosition =
-         (slice_header->slice_segment_address + num_ctu_in_slice) / ctb_w;
-      vdenc_walker.NextSliceMBLCUStartXPosition =
-         (slice_header->slice_segment_address + num_ctu_in_slice) / ctb_h;
-#if GFX_VERx10 < 125
-      vdenc_walker.TileWidth = width_in_pix - 1;
-      vdenc_walker.TileHeight = height_in_pix - 1;
-#endif
-   }
-}
-
-static void
-anv_h265_emit_hcp_pipeline_flush(struct anv_cmd_buffer *cmd)
-{
-   anv_batch_emit(&cmd->batch, GENX(VD_PIPELINE_FLUSH), flush) {
-      flush.HEVCPipelineDone = true;
-      flush.HEVCPipelineCommandFlush = true;
-      flush.VDCommandMessageParserDone = true;
-   }
-}
-
-static bool
-anv_h265_is_low_delay(const VkVideoEncodeInfoKHR *enc_info,
-                      StdVideoEncodeH265ReferenceListsInfo * ref_lists)
-{
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info =
-      anv_h265_frame_info(enc_info);
-
-   if (!ref_lists)
-      return true;
-
-   for (unsigned list = 0; list < 2; list++) {
-      const uint8_t *ref_pic_list = list == 0 ? ref_lists->RefPicList0 :
-                                                ref_lists->RefPicList1;
-      unsigned ref_cnt = (list == 0 ? ref_lists->num_ref_idx_l0_active_minus1 :
-                                      ref_lists->num_ref_idx_l1_active_minus1) + 1;
-
-      for (unsigned i = 0; i < ref_cnt; i++) {
-         const VkVideoReferenceSlotInfoKHR *slot;
-         const VkVideoEncodeH265DpbSlotInfoKHR *dpb;
-
-         if (ref_pic_list[i] == STD_VIDEO_H265_NO_REFERENCE_PICTURE)
-            continue;
-
-         slot = anv_h265_find_ref_slot(enc_info, ref_pic_list[i]);
-
-         if (!slot)
-            continue;
-
-         dpb = vk_find_struct_const(slot->pNext, VIDEO_ENCODE_H265_DPB_SLOT_INFO_KHR);
-
-         if (dpb && dpb->pStdReferenceInfo->PicOrderCntVal >
-                    frame_info->pStdPictureInfo->PicOrderCntVal) {
-            return false;
-         }
-      }
-   }
-
-   return true;
-}
-
+#if GFX_VER >= 12
 static void
 anv_h265_brc_store_pak_stats(struct anv_cmd_buffer *cmd)
 {
@@ -3878,12 +3150,43 @@ anv_h265_brc_store_pak_stats(struct anv_cmd_buffer *cmd)
       srm.MemoryAddress = anv_address_add(pak_stats_addr, 8);
    }
 }
-
 #endif
 
-extern const uint16_t anv_h265_rdoq_lambda_8bit[2][2][2][52];
-extern const uint16_t anv_h265_rdoq_lambda_10bit[2][2][2][64];
 
+#if GFX_VER >= 12
+static void
+anv_video_emit_force_wakeup(struct anv_cmd_buffer *cmd, bool hevc_power_well)
+{
+   anv_batch_emit(&cmd->batch, GENX(MI_FORCE_WAKEUP), wake) {
+      wake.MFXPowerWellControl = 1;
+      if (hevc_power_well)
+         wake.HEVCPowerWellControl = 1;
+      wake.MaskBits = 768;
+   }
+}
+#endif
+
+
+/* Debug: leave a marker dword in host visible memory at each checkpoint of the
+ * encode batch, so a hung batch can be located from the CPU.
+ */
+static void
+anv_h265_brc_marker(struct anv_cmd_buffer *cmd, uint32_t value)
+{
+   struct anv_video_session *vid = cmd->video.vid;
+
+   if (vid == NULL || vid->brc_marker_bo == NULL)
+      return;
+
+   anv_batch_emit(&cmd->batch, GENX(MI_STORE_DATA_IMM), sdi) {
+      sdi.Address = (struct anv_address) { vid->brc_marker_bo, 0 };
+      sdi.ImmediateData = value;
+   }
+}
+
+/* HEVC_VP9_RDOQ_STATE (HCP subopcode 8, 154 dwords): per slice type lambda
+ * tables for the VDEnc RDOQ.  media-driver emits it for every frame.
+ */
 static void
 anv_h265_emit_rdoq_state(struct anv_batch *batch, bool is_intra,
                          uint32_t bit_depth, bool disable_htq_perf)
@@ -3931,32 +3234,171 @@ anv_h265_emit_rdoq_state(struct anv_batch *batch, bool is_intra,
       dw[i] = 0;
 }
 
+/* HEVC line / metadata buffers are rotated per in-flight frame. */
+#define ANV_H265_LINE_INIT(buf_, field_, type_)                                 \
+   do {                                                                         \
+      (buf_).field_##Address =                                                  \
+         anv_video_h265_line_addr(vid, (type_), vid->h265_slot);                \
+      (buf_).field_##AddressAttributes =                                        \
+         ANV_VID_ATTR(cmd->device, vid->vid_mem[(type_)].mem->bo);              \
+   } while (0)
+
 static void
 anv_h265_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
 {
+   anv_h265_brc_marker(cmd, 0x100 | (cmd->video.vid ?
+                                     cmd->video.vid->rc.frame_counter : 0));
+
+   /* Debug: snapshot the frame statistics the HuC consumes for this frame. */
+   if (getenv("ANV_BRC_DEBUG_DUMP") &&
+       cmd->video.vid != NULL && cmd->video.vid->brc_marker_bo != NULL) {
+      struct anv_address src =
+         ANV_VID_MEM_ADDR(cmd->video.vid, ANV_VID_MEM_H265_FRAME_STATS_STREAMOUT);
+      struct anv_address dst =
+         (struct anv_address) { cmd->video.vid->brc_marker_bo,
+            4096 + 81920 + 4096 +
+               (cmd->video.vid->rc.frame_counter & 7) * 4096 };
+
+      for (uint32_t i = 0; i < 1024; i++) {
+         anv_batch_emit(&cmd->batch, GENX(MI_COPY_MEM_MEM), cp) {
+            cp.DestinationMemoryAddress = anv_address_add(dst, i * 4);
+            cp.SourceMemoryAddress = anv_address_add(src, i * 4);
+         }
+      }
+   }
    /* Supported on Gen12(+) for using VDEnc Mode */
 #if GFX_VER >= 12
-   const struct VkVideoEncodeH265PictureInfoKHR *frame_info = anv_h265_frame_info(enc_info);
-   const StdVideoH265VideoParameterSet *vps = anv_h265_vps(cmd, enc_info);
-   const StdVideoH265SequenceParameterSet *sps = anv_h265_sps(cmd, enc_info);
-   const StdVideoH265PictureParameterSet *pps = anv_h265_pps(cmd, enc_info);
-   StdVideoEncodeH265ReferenceListsInfo* ref_lists =
-      (struct StdVideoEncodeH265ReferenceListsInfo *)frame_info->pStdPictureInfo->pRefLists;
+   ANV_FROM_HANDLE(anv_buffer, dst_buffer, enc_info->dstBuffer);
+   struct anv_video_session *vid = cmd->video.vid;
+   struct vk_video_session_parameters *params = cmd->video.params;
 
-   bool is_low_delay = anv_h265_is_low_delay(enc_info, ref_lists);
-   uint8_t dpb_idx[ANV_VIDEO_H265_MAX_NUM_REF_FRAME] = { 0,};
+   const struct VkVideoEncodeH265PictureInfoKHR *frame_info =
+      vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
 
-   for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
-      int slot_idx = enc_info->pReferenceSlots[i].slotIndex;
+   const StdVideoH265VideoParameterSet *vps = vk_video_find_h265_enc_std_vps(params, frame_info->pStdPictureInfo->sps_video_parameter_set_id);
+   const StdVideoH265SequenceParameterSet *sps = vk_video_find_h265_enc_std_sps(params, frame_info->pStdPictureInfo->pps_seq_parameter_set_id);
+   const StdVideoH265PictureParameterSet *pps = vk_video_find_h265_enc_std_pps(params, frame_info->pStdPictureInfo->pps_pic_parameter_set_id);
+   const StdVideoEncodeH265ReferenceListsInfo *ref_lists =
+      frame_info->pStdPictureInfo->pRefLists ?
+      frame_info->pStdPictureInfo->pRefLists : &anv_h265_no_ref_lists;
+   StdVideoEncodeH265PictureInfo pic_info = *frame_info->pStdPictureInfo;
+   pic_info.flags.slice_temporal_mvp_enabled_flag &=
+      sps->flags.sps_temporal_mvp_enabled_flag;
+   const bool is_10bit = (sps->bit_depth_luma_minus8 == 2) || (sps->bit_depth_chroma_minus8 == 2);
+   /* media-driver disables temporal MVP for I and P (VDENC_CMD2). P frames use
+    * VDENC picture type 3 (GPB) but keep an HCP P slice with L0-only REF_IDX.
+    */
+   const bool is_i_frame =
+      anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0;
+   if (getenv("ANV_BRC_DEBUG_PICTYPE"))
+      fprintf(stderr, "H265 pic fc=%u type=%d nal=%d slices=%u poc=%d refs=%u\n",
+              vid->rc.frame_counter,
+              (int)frame_info->pStdPictureInfo->pic_type,
+              0,
+              frame_info->naluSliceSegmentEntryCount,
+              (int)frame_info->pStdPictureInfo->PicOrderCntVal,
+              enc_info->referenceSlotCount);
+   const bool is_p_frame =
+      frame_info->pStdPictureInfo->pic_type == STD_VIDEO_H265_PICTURE_TYPE_P;
 
-      assert(slot_idx < ANV_VIDEO_H265_MAX_NUM_REF_FRAME);
-      dpb_idx[slot_idx] = i;
+   const struct anv_image_view *iv = anv_image_view_from_handle(enc_info->srcPictureResource.imageViewBinding);
+   const struct anv_image *src_img = iv->image;
+
+   const struct anv_image_view *base_ref_iv;
+   uint32_t base_ref_array_layer;
+
+   bool rc_disable = cmd->video.vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+   /* Apply the supported QP range before indexing the CMD1 lambda table.
+    * In default rate control mode, the PPS initial QP can be below minQp.
+    */
+   int32_t frame_qp = rc_disable ?
+      frame_info->pNaluSliceSegmentEntries[0].constantQp :
+      pps->init_qp_minus26 + 26;
+   frame_qp = CLAMP(frame_qp, 10, 51);
+   bool is_low_delay = true;
+
+   if (ref_lists) {
+      for (unsigned list = 0; list < 2; list++) {
+         const uint8_t *ref_pic_list = list == 0 ? ref_lists->RefPicList0 :
+                                                   ref_lists->RefPicList1;
+         unsigned ref_cnt = (list == 0 ? ref_lists->num_ref_idx_l0_active_minus1 :
+                                         ref_lists->num_ref_idx_l1_active_minus1) + 1;
+
+         for (unsigned i = 0; i < ref_cnt; i++) {
+            const VkVideoReferenceSlotInfoKHR *slot;
+            const VkVideoEncodeH265DpbSlotInfoKHR *dpb;
+
+            if (ref_pic_list[i] == STD_VIDEO_H265_NO_REFERENCE_PICTURE)
+               continue;
+
+            slot = anv_h265_find_ref_slot(enc_info, ref_pic_list[i]);
+
+            if (!slot)
+               continue;
+
+            dpb = vk_find_struct_const(slot->pNext, VIDEO_ENCODE_H265_DPB_SLOT_INFO_KHR);
+
+            if (dpb && dpb->pStdReferenceInfo &&
+                dpb->pStdReferenceInfo->PicOrderCntVal >
+                   frame_info->pStdPictureInfo->PicOrderCntVal)
+               is_low_delay = false;
+         }
+      }
    }
 
-   struct anv_video_session *vid = cmd->video.vid;
+   if (enc_info->pSetupReferenceSlot) {
+      base_ref_iv = anv_image_view_from_handle(enc_info->pSetupReferenceSlot->pPictureResource->imageViewBinding);
+      base_ref_array_layer = enc_info->pSetupReferenceSlot->pPictureResource->baseArrayLayer;
+   } else {
+      base_ref_iv = iv;
+      base_ref_array_layer = enc_info->srcPictureResource.baseArrayLayer;
+   }
+
+   const struct anv_image *base_ref_img = base_ref_iv->image;
+   /* Keep forward-reference numbering in L0 order. VDEnc/PAK reference
+    * ordinals must agree with HCP even when pReferenceSlots is ordered
+    * differently from RefPicList0. Append the remaining references for L1.
+    */
+   uint8_t dpb_idx[ANV_VIDEO_H265_MAX_NUM_REF_FRAME];
+   memset(dpb_idx, 0xff, sizeof(dpb_idx));
+   unsigned num_dpb_refs = 0;
+   if (!is_i_frame) {
+      for (unsigned i = 0; i <= ref_lists->num_ref_idx_l0_active_minus1; i++) {
+         uint8_t slot = ref_lists->RefPicList0[i];
+         assert(slot < ARRAY_SIZE(dpb_idx));
+         if (dpb_idx[slot] == 0xff)
+            dpb_idx[slot] = num_dpb_refs++;
+      }
+   }
+   for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
+      unsigned slot = enc_info->pReferenceSlots[i].slotIndex;
+      assert(slot < ARRAY_SIZE(dpb_idx));
+      if (dpb_idx[slot] == 0xff)
+         dpb_idx[slot] = num_dpb_refs++;
+   }
+   assert(num_dpb_refs <= ANV_VIDEO_H265_HCP_NUM_REF_FRAME);
+
+   anv_batch_emit(&cmd->batch, GENX(MI_FLUSH_DW), flush) {
+      flush.VideoPipelineCacheInvalidate = 1;
+   };
+
+
+   anv_batch_emit(&cmd->batch, GENX(MI_FORCE_WAKEUP), wake) {
+      wake.MFXPowerWellControl = 1;
+      wake.HEVCPowerWellControl = 1;
+      wake.MaskBits = 768;
+   }
+
    bool brc_enabled =
       vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR ||
       vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR;
+
+   /* Alternate the HuC-BRC EXEC SLB per frame, like media-driver's
+    * per-recycled-buffer second level batch buffer.
+    */
+   vid->rc.brc_exec_slb_idx = vid->rc.frame_counter % 6;
+   if (getenv("ANV_BRC_DEBUG_SLB_SLOT0"))
+      vid->rc.brc_exec_slb_idx = 0;
    uint32_t num_passes = 1;
    uint32_t brc_frame_qp = 0;
    struct anv_h265_brc_slb_layout slb_layout = { 0 };
@@ -3965,7 +3407,7 @@ anv_h265_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
    struct anv_state brc_const_data[2] = { ANV_STATE_NULL, ANV_STATE_NULL };
 
    if (brc_enabled) {
-      /* TODO: weighted prediction is not included into the BRC SLB yet */
+      /* TODO: weighted prediction is not included into the BRC SLB yet. */
       assert(!pps->flags.weighted_pred_flag && !pps->flags.weighted_bipred_flag);
 
       num_passes = 2;
@@ -3992,6 +3434,17 @@ anv_h265_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
          anv_h265_brc_build_input_slb(cmd, enc_info, dpb_idx, &slb_layout,
                                       is_low_delay, pass > 0, brc_input_slb[pass]);
 
+         if (getenv("ANV_BRC_DEBUG_SLB")) {
+            char name[80];
+            snprintf(name, sizeof(name), "/tmp/anv-in-slb-fc%u-p%u.bin",
+                     vid->rc.frame_counter, pass);
+            FILE *f = fopen(name, "wb");
+            if (f) {
+               fwrite(brc_input_slb[pass].map, 1, slb_layout.data_size, f);
+               fclose(f);
+            }
+         }
+
          memset(brc_const_data[pass].map, 0,
                 sizeof(struct anv_huc_hevc_brc_const_data));
          anv_h265_brc_fill_const_data(&slb_layout,
@@ -3999,146 +3452,1116 @@ anv_h265_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
                                       pass, brc_const_data[pass].map);
 
          memset(brc_update_dmem[pass].map, 0, sizeof(anv_h265_brc_update_dmem));
-         anv_h265_brc_fill_update_dmem(cmd, frame_info, sps, ref_lists, &slb_layout,
+         anv_h265_brc_fill_update_dmem(cmd, enc_info, frame_info, sps, ref_lists, &slb_layout,
                                        brc_frame_qp, pass,
                                        anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type),
                                        is_low_delay, brc_update_dmem[pass].map);
       }
    }
 
-   anv_video_emit_mi_flush_dw(cmd, true);
-   anv_video_emit_force_wakeup(cmd, true);
    for (uint32_t pass = 0; pass < num_passes; pass++) {
       if (brc_enabled) {
-         if (pass == 0 && vid->rc.frame_counter == 0)
+         anv_video_emit_mi_flush_dw(cmd, true);
+         anv_video_emit_force_wakeup(cmd, true);
+
+         if (pass == 0 && vid->rc.frame_counter == 0) {
             anv_h265_brc_emit_huc_init(cmd, sps, is_low_delay);
+            /* Debug: run the init kernel twice, to see whether the hang is
+             * tied to the number of HuC kernel invocations.
+             */
+            if (getenv("ANV_BRC_DEBUG_EXTRA_INIT"))
+               anv_h265_brc_emit_huc_init(cmd, sps, is_low_delay);
+         }
 
          anv_h265_brc_emit_huc_update(cmd, brc_update_dmem[pass],
                                       sizeof(anv_h265_brc_update_dmem),
                                       brc_input_slb[pass], brc_const_data[pass]);
+      }
 
-         if (pass > 0) {
-            /* TODO: media-driver gates the re-encode pass on HUC_STATUS bit 31
-             * with MI_CONDITIONAL_BATCH_BUFFER_END, but that terminates the whole
-             * batch including the query writes emitted after the encode in the
-             * same command buffer; always run the PAK only pass instead until
-             * this is reworked as a predicated batch buffer jump */
-#if GFX_VERx10 < 125
-            struct anv_address pak_stats_addr =
-               ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_PAK_STATS);
+   anv_h265_brc_marker(cmd, 0x200 | (vid->rc.frame_counter & 0xff));
 
-            anv_batch_emit(&cmd->batch, GENX(MI_LOAD_REGISTER_MEM), lrm) {
-               lrm.RegisterAddress = ANV_H265_HCP_IMAGE_STATUS_CONTROL_OFFSET;
-               lrm.AddCSMMIOStartOffset = 1;
-               lrm.MemoryAddress = anv_address_add(pak_stats_addr, 8);
-            }
+   anv_batch_emit(&cmd->batch, GENX(VDENC_CONTROL_STATE), v) {
+      v.VdencInitialization = true;
+   }
 
-            anv_batch_emit(&cmd->batch, GENX(MI_STORE_REGISTER_MEM), srm) {
-               srm.RegisterAddress = ANV_H265_HCP_IMAGE_STATUS_CONTROL_OFFSET;
-               srm.AddCSMMIOStartOffset = 1;
-               srm.MemoryAddress = anv_address_add(pak_stats_addr, 12);
-            }
+   anv_batch_emit(&cmd->batch, GENX(VD_CONTROL_STATE), v) {
+      v.VDControlState.PipelineInitialization = true;
+#if GFX_VERx10 >= 125
+      v.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd->device->info, 16021867713);
 #endif
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(MFX_WAIT), mfx) {
+      mfx.MFXSyncControlFlag = 1;
+   }
+
+   anv_h265_emit_hcp_pipe_mode_select(cmd, NULL, enc_info, false);
+
+
+   anv_batch_emit(&cmd->batch, GENX(MFX_WAIT), mfx) {
+      mfx.MFXSyncControlFlag = 1;
+   }
+
+
+   for (uint32_t i = 0; i < 3; i++) {
+      anv_batch_emit(&cmd->batch, GENX(HCP_SURFACE_STATE), ss) {
+         struct anv_image *img_ = NULL;
+
+         switch(i) {
+            case 0:
+               img_ = (struct anv_image *) src_img;
+               ss.SurfaceID = HCP_SourceInputPicture;
+               break;
+            case 1:
+               //img_ = (struct anv_image *) src_img;
+               img_ = (struct anv_image *) base_ref_img;
+               ss.SurfaceID = HCP_CurrentDecodedPicture;
+               break;
+            case 2:
+               img_ = (struct anv_image *) base_ref_img;
+               ss.SurfaceID = HCP_ReferencePicture;
+               break;
+            default:
+               assert(0);
+         }
+
+         ss.SurfacePitch = img_->planes[0].primary_surface.isl.row_pitch_B - 1;
+         if (!is_10bit)
+            ss.SurfaceFormat = PLANAR_420_8;
+         else if (ss.SurfaceID == HCP_SourceInputPicture)
+            ss.SurfaceFormat = P010;
+         else
+            ss.SurfaceFormat = P010Variant;
+
+         ss.YOffsetforUCb = img_->planes[1].primary_surface.memory_range.offset /
+                            img_->planes[0].primary_surface.isl.row_pitch_B;
+         ss.YOffsetforVCr = ss.YOffsetforUCb;
+      }
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(HCP_PIPE_BUF_ADDR_STATE), buf) {
+      buf.DecodedPictureAddress =
+         anv_image_dpb_address(base_ref_iv, base_ref_array_layer);
+
+      buf.DecodedPictureAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd->device, buf.DecodedPictureAddress.bo, 0),
+#if GFX_VERx10 >= 125
+         .TiledResourceMode = TRMODE_TILEF,
+#endif
+      };
+
+      ANV_H265_LINE_INIT(buf, DeblockingFilterLineBuffer, ANV_VID_MEM_H265_DEBLOCK_FILTER_ROW_STORE_LINE);
+
+      ANV_H265_LINE_INIT(buf, DeblockingFilterTileLineBuffer, ANV_VID_MEM_H265_DEBLOCK_FILTER_ROW_STORE_TILE_LINE);
+
+      ANV_H265_LINE_INIT(buf, DeblockingFilterTileColumnBuffer, ANV_VID_MEM_H265_DEBLOCK_FILTER_ROW_STORE_TILE_COLUMN);
+
+      ANV_H265_LINE_INIT(buf, MetadataLineBuffer, ANV_VID_MEM_H265_METADATA_LINE);
+
+      ANV_H265_LINE_INIT(buf, MetadataTileLineBuffer, ANV_VID_MEM_H265_METADATA_TILE_LINE);
+
+      ANV_H265_LINE_INIT(buf, MetadataTileColumnBuffer, ANV_VID_MEM_H265_METADATA_TILE_COLUMN);
+
+      ANV_H265_LINE_INIT(buf, SAOLineBuffer, ANV_VID_MEM_H265_SAO_LINE);
+
+      ANV_H265_LINE_INIT(buf, SAOTileLineBuffer, ANV_VID_MEM_H265_SAO_TILE_LINE);
+
+      ANV_H265_LINE_INIT(buf, SAOTileColumnBuffer, ANV_VID_MEM_H265_SAO_TILE_COLUMN);
+
+      buf.CurrentMVTemporalBufferAddress =
+         anv_image_dmv_top_address(base_ref_iv, base_ref_array_layer);
+
+      buf.CurrentMVTemporalBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, buf.CurrentMVTemporalBufferAddress.bo);
+
+      for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
+         const struct anv_image_view *ref_iv =
+            anv_image_view_from_handle(enc_info->pReferenceSlots[i].pPictureResource->imageViewBinding);
+         int slot_idx = enc_info->pReferenceSlots[i].slotIndex;
+
+         assert(slot_idx < ANV_VIDEO_H265_MAX_NUM_REF_FRAME);
+         buf.ReferencePictureAddress[dpb_idx[slot_idx]] =
+            anv_image_dpb_address(ref_iv, enc_info->pReferenceSlots[i].pPictureResource->baseArrayLayer);
+      }
+
+      buf.ReferencePictureAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+#if GFX_VERx10 >= 125
+         .TiledResourceMode = TRMODE_TILEF,
+#endif
+      };
+
+      buf.OriginalUncompressedPictureSourceAddress =
+         anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer);
+      buf.OriginalUncompressedPictureSourceAddressAttributes =
+         (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd->device,
+                             buf.OriginalUncompressedPictureSourceAddress.bo, 0),
+#if GFX_VERx10 >= 125
+            /* Xe2 TileMode bits 14:13: 0=linear, 3=TileF/Tile4. Leaving this
+             * at the ANV_VID_ATTR default (0) makes HCP walk a Tile4 source
+             * as linear.
+             */
+            .TiledResourceMode = TRMODE_TILEF,
+#endif
+         };
+
+      buf.StreamOutDataDestinationAddress =
+         anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_PAK_STREAMOUT, vid->h265_slot);
+      buf.StreamOutDataDestinationAddressAttributes =
+         ANV_VID_ATTR(cmd->device, vid->vid_mem[ANV_VID_MEM_H265_PAK_STREAMOUT].mem->bo);
+
+      buf.DecodedPictureStatusBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      buf.LCUILDBStreamOutBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      for (unsigned i = 0; i < enc_info->referenceSlotCount; i++) {
+         const struct anv_image_view *ref_iv =
+            anv_image_view_from_handle(enc_info->pReferenceSlots[i].pPictureResource->imageViewBinding);
+
+         unsigned slot = enc_info->pReferenceSlots[i].slotIndex;
+         buf.CollocatedMVTemporalBufferAddress[dpb_idx[slot]] =
+            anv_image_dmv_top_address(ref_iv, enc_info->pReferenceSlots[i].pPictureResource->baseArrayLayer);
+      }
+
+      buf.CollocatedMVTemporalBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device,
+                      buf.CollocatedMVTemporalBufferAddress[0].bo);
+
+      buf.VP9ProbabilityBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      buf.VP9SegmentIDBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      buf.VP9HVDLineRowStoreBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      buf.VP9HVDTileRowStoreBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      buf.SAOStreamOutDataDestinationBufferBaseAddress =
+         anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_SAO_STREAMOUT, vid->h265_slot);
+      buf.SAOStreamOutDataDestinationBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device,
+                      buf.SAOStreamOutDataDestinationBufferBaseAddress.bo);
+      if (brc_enabled) {
+         /* The HuC BRC update reads the previous frame's PAK statistics from
+          * this buffer, so it must stay single instanced: giving each
+          * in-flight frame its own copy starves the rate control model and
+          * produces near lossless frames.
+          */
+         buf.FrameStatisticsStreamOutDataDestinationBufferBaseAddress =
+            anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_FRAME_STATS_STREAMOUT, 0);
+         buf.FrameStatisticsStreamOutDataDestinationBufferAddressAttributes =
+            ANV_VID_ATTR(cmd->device,
+                         buf.FrameStatisticsStreamOutDataDestinationBufferBaseAddress.bo);
+      } else {
+         buf.FrameStatisticsStreamOutDataDestinationBufferAddressAttributes =
+            ANV_VID_ATTR(cmd->device, NULL);
+      }
+
+      buf.SSESourcePixelRowStoreBufferBaseAddress =
+         anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_SSE_SRC_PIX_ROW_STORE, vid->h265_slot);
+
+      buf.SSESourcePixelRowStoreBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device,
+                      buf.SSESourcePixelRowStoreBufferBaseAddress.bo);
+
+      buf.HCPScalabilitySliceStateBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      buf.HCPScalabilityCABACDecodedSyntaxElementsBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      buf.MVUpperRightColumnStoreBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      buf.IntraPredictionUpperRightColumnStoreBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      buf.IntraPredictionLeftReconColumnStoreBufferAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(HCP_IND_OBJ_BASE_ADDR_STATE), indirect) {
+      indirect.HCPIndirectBitstreamObjectAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      indirect.HCPIndirectCUObjectAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+
+      indirect.HCPPAKBSEObjectBaseAddress =
+            anv_address_add(dst_buffer->address,  align(enc_info->dstBufferOffset, 4096));
+      indirect.HCPPAKBSEObjectAddressAttributes =
+         ANV_VID_ATTR(cmd->device, indirect.HCPPAKBSEObjectBaseAddress.bo);
+
+      indirect.HCPVP9PAKCompressedHeaderSyntaxStreamInAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      indirect.HCPVP9PAKProbabilityCounterStreamOutAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      indirect.HCPVP9PAKProbabilityDeltasStreamInAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      indirect.HCPVP9PAKTileRecordStreamOutAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+      indirect.HCPVP9PAKCULevelStatisticStreamOutAddressAttributes =
+         ANV_VID_ATTR(cmd->device, NULL);
+   }
+
+   if (sps->flags.scaling_list_enabled_flag) {
+      assert(0);
+      /* FIXME */
+      if (pps->flags.pps_scaling_list_data_present_flag) {
+         scaling_list(cmd, pps->pScalingLists);
+      } else if (sps->flags.sps_scaling_list_data_present_flag) {
+         scaling_list(cmd, sps->pScalingLists);
+      }
+   } else {
+      for (uint8_t size = 0; size < 4; size++) {
+         for (uint8_t pred = 0; pred < 2; pred++) {
+            anv_batch_emit(&cmd->batch, GENX(HCP_FQM_STATE), fqm) {
+               fqm.SizeID = size;
+               fqm.IntraInter = pred;
+               fqm.ColorComponent = 0;
+               fqm.FQMDCValue = size < 2 ? 0 : 0x1000;
+
+               unsigned len = (size == 0) ? 32 : 128;
+
+               for (uint8_t q = 0; q < len; q++) {
+                  fqm.QuantizerMatrix8x8[q] = q % 2 == 0 ? 0 : 0x10;
+               }
+            }
+         }
+      }
+   }
+
+   if (sps->flags.scaling_list_enabled_flag) {
+      assert(0);
+      /* FIXME */
+      if (pps->flags.pps_scaling_list_data_present_flag) {
+         scaling_list(cmd, pps->pScalingLists);
+      } else if (sps->flags.sps_scaling_list_data_present_flag) {
+         scaling_list(cmd, sps->pScalingLists);
+      }
+   } else {
+      for (uint8_t size = 0; size < 4; size++) {
+         for (uint8_t pred = 0; pred < 2; pred++) {
+            for (uint8_t color = 0; color < 3; color++) {
+
+               if (size == 3 && color > 0)
+                  continue;
+
+               anv_batch_emit(&cmd->batch, GENX(HCP_QM_STATE), qm) {
+                  qm.SizeID = size;
+                  qm.PredictionType = pred;
+                  qm.ColorComponent = color;
+                  qm.DCCoefficient = (size > 1) ? 16 : 0;
+                  unsigned len = (size == 0) ? 16 : 64;
+
+                  for (uint8_t q = 0; q < len; q++)
+                     qm.QuantizerMatrix8x8[q] = 0x10;
+               }
+            }
+         }
+      }
+   }
+
+
+   const bool has_ds = anv_image_has_vdenc_ds(base_ref_img);
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_MODE_SELECT), vdenc_pipe_mode) {
+      vdenc_pipe_mode.StandardSelect = SS_HEVC;
+      vdenc_pipe_mode.BitDepth = is_10bit ? 2 : 0;
+      vdenc_pipe_mode.PAKChromaSubSamplingType = _420;
+      vdenc_pipe_mode.OutputRangeControlAfterColorSpaceConversion = true;
+      vdenc_pipe_mode.IsRandomAccess = !is_low_delay;
+      vdenc_pipe_mode.FrameStatisticsStreamOutEnable = brc_enabled;
+      vdenc_pipe_mode.VDEncPAK_OBJ_CMDStreamOutEnable = brc_enabled && pass == 0;
+      /* media-driver always writes 4x/8x DS on every frame and leaves HME
+       * prefetch at the packet default (enabled). Without DS surfaces the
+       * hardware hangs on the first P-frame.
+       */
+      vdenc_pipe_mode.DownScaled8xWriteDisable = !has_ds;
+      vdenc_pipe_mode.DownScaled4xWriteDisable = !has_ds;
+      /* media-driver default is enabled. Xe2 HEVC P-frames still walk the
+       * 4x/8x DS refs even when this bit is clear, so the surfaces must be
+       * written on I and prefetched on P.
+       */
+      vdenc_pipe_mode.HMERegionPrefetchEnable = has_ds;
+      vdenc_pipe_mode.TopPrefetchEnableMode = 0;
+      vdenc_pipe_mode.LeftPrefetchAtWrapAround = true;
+      vdenc_pipe_mode.VerticalShift32Minus1 = 2;
+      vdenc_pipe_mode.HzShift32Minus1 = 3;
+      vdenc_pipe_mode.NumberofVerticalRequests = 6;
+      vdenc_pipe_mode.NumberofHorizontalRequests = 2;
+
+      vdenc_pipe_mode.SourceLumaPackedDataTLBPrefetchEnable = true;
+      vdenc_pipe_mode.SourceChromaTLBPrefetchEnable = true;
+      vdenc_pipe_mode.HzShift32Minus1Src = 3;
+      vdenc_pipe_mode.PrefetchOffsetforSource = 4;
+      vdenc_pipe_mode.VDENCPipeModeSelectPar0 = true;
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_SRC_SURFACE_STATE), vdenc_surface) {
+      vdenc_surface.SurfaceState.Width = enc_info->srcPictureResource.codedExtent.width - 1;
+      vdenc_surface.SurfaceState.Height = enc_info->srcPictureResource.codedExtent.height - 1;
+      vdenc_surface.SurfaceState.SurfaceFormat = is_10bit ? VDENC_P010 : VDENC_PLANAR_420_8;
+
+      vdenc_surface.SurfaceState.TileWalk = TW_YMAJOR;
+      vdenc_surface.SurfaceState.TiledSurface = src_img->planes[0].primary_surface.isl.tiling != ISL_TILING_LINEAR;
+      vdenc_surface.SurfaceState.SurfacePitch = src_img->planes[0].primary_surface.isl.row_pitch_B - 1;
+      vdenc_surface.SurfaceState.YOffsetforUCb = src_img->planes[1].primary_surface.memory_range.offset /
+         src_img->planes[0].primary_surface.isl.row_pitch_B;
+      vdenc_surface.SurfaceState.YOffsetforVCr = src_img->planes[1].primary_surface.memory_range.offset /
+         src_img->planes[0].primary_surface.isl.row_pitch_B;
+      vdenc_surface.SurfaceState.ChromaDownsampleFilterControl = 7;
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_REF_SURFACE_STATE), vdenc_surface) {
+      vdenc_surface.SurfaceState.Width = base_ref_img->vk.extent.width - 1;
+      vdenc_surface.SurfaceState.Height = base_ref_img->vk.extent.height - 1;
+      vdenc_surface.SurfaceState.SurfaceFormat = is_10bit ? VDENC_P010_VARIANT : VDENC_PLANAR_420_8;
+      vdenc_surface.SurfaceState.SurfacePitch = base_ref_img->planes[0].primary_surface.isl.row_pitch_B - 1;
+
+      vdenc_surface.SurfaceState.TileWalk = TW_YMAJOR;
+      vdenc_surface.SurfaceState.TiledSurface = base_ref_img->planes[0].primary_surface.isl.tiling != ISL_TILING_LINEAR;
+      vdenc_surface.SurfaceState.YOffsetforUCb = base_ref_img->planes[1].primary_surface.memory_range.offset /
+         base_ref_img->planes[0].primary_surface.isl.row_pitch_B;
+      vdenc_surface.SurfaceState.YOffsetforVCr = base_ref_img->planes[1].primary_surface.memory_range.offset /
+         base_ref_img->planes[0].primary_surface.isl.row_pitch_B;
+   }
+
+   if (has_ds) {
+      anv_batch_emit(&cmd->batch, GENX(VDENC_DS_REF_SURFACE_STATE), ds) {
+         anv_vdenc_fill_hevc_ds_surface(&ds.SurfaceState0, base_ref_img, true);
+         anv_vdenc_fill_hevc_ds_surface(&ds.SurfaceState1, base_ref_img, false);
+      }
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_BUF_ADDR_STATE), vdenc_buf) {
+      /* TODO. add DSFWDREF and FWDREF */
+      vdenc_buf.DSFWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+
+      vdenc_buf.DSFWDREF1.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+
+#if GFX_VERx10 >= 125
+      vdenc_buf.DSBWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#endif
+
+      vdenc_buf.OriginalUncompressedPicture.Address =
+         anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer);
+      vdenc_buf.OriginalUncompressedPicture.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.OriginalUncompressedPicture.Address.bo, 0),
+      };
+
+      vdenc_buf.StreamInDataPicture.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+
+      vdenc_buf.RowStoreScratchBuffer.Address =
+         anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_VDENC_INTRA_ROW_STORE, vid->h265_slot);
+
+      vdenc_buf.RowStoreScratchBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.RowStoreScratchBuffer.Address.bo, 0),
+      };
+
+      const struct anv_image_view *ref_iv[3] = { 0, };
+      const struct anv_image_view *bwd_ref_iv = NULL;
+      uint32_t ref_layer[3] = { 0, };
+      uint32_t bwd_ref_layer = 0;
+
+      if (ref_lists) {
+         for (unsigned i = 0; i < ref_lists->num_ref_idx_l0_active_minus1 + 1 && i < 3; i++) {
+            const VkVideoReferenceSlotInfoKHR *slot =
+               anv_h265_find_ref_slot(enc_info, ref_lists->RefPicList0[i]);
+
+            if (!slot)
+               continue;
+
+            ref_iv[i] = anv_image_view_from_handle(slot->pPictureResource->imageViewBinding);
+            ref_layer[i] = slot->pPictureResource->baseArrayLayer;
+         }
+
+         if (!is_low_delay) {
+            const VkVideoReferenceSlotInfoKHR *slot =
+               anv_h265_find_ref_slot(enc_info, ref_lists->RefPicList1[0]);
+
+            if (slot) {
+               bwd_ref_iv = anv_image_view_from_handle(slot->pPictureResource->imageViewBinding);
+               bwd_ref_layer = slot->pPictureResource->baseArrayLayer;
+            }
          }
       }
 
-      anv_vdenc_emit_control_state(cmd);
-      anv_video_emit_vd_control_state(cmd);
-      anv_video_emit_mfx_wait(cmd, NULL);
-      anv_h265_emit_hcp_pipe_mode_select(cmd, NULL, enc_info, brc_enabled);
-      anv_video_emit_mfx_wait(cmd, NULL);
+      /* HW requires BwdRef0 == FwdRef0 for HEVC P frames (media-driver
+       * isPFrame). Low-delay GPB leaves L1 unused at VDENC, so copy L0[0].
+       */
+      if (is_p_frame && ref_iv[0] && !bwd_ref_iv) {
+         bwd_ref_iv = ref_iv[0];
+         bwd_ref_layer = ref_layer[0];
+      }
 
-      anv_h265_emit_hcp_surface_state(cmd, enc_info);
-      anv_h265_emit_hcp_pipe_buf_addr_state(cmd, enc_info);
-      anv_h265_emit_hcp_ind_obj_base_addr_state(cmd, enc_info);
-      anv_h265_emit_hcp_fqm_state(cmd, enc_info);
-      anv_h265_emit_hcp_qm_state(cmd, enc_info);
+      if (ref_iv[0]) {
+         vdenc_buf.ColocatedMVReadBuffer.Address =
+               anv_image_dmv_top_address(ref_iv[0], ref_layer[0]);
+         vdenc_buf.FWDREF0.Address =
+               anv_image_dpb_address(ref_iv[0], ref_layer[0]);
+      }
 
-      anv_h265_emit_vdenc_pipe_mode_select(cmd, enc_info, brc_enabled, pass > 0, is_low_delay);
-      anv_h265_emit_vdenc_src_surface_state(cmd, enc_info);
-      anv_h265_emit_vdenc_ref_surface_state(cmd, enc_info);
-      anv_h265_emit_vdenc_ds_ref_surface_state(cmd, enc_info);
-      anv_h265_emit_vdenc_pipe_buf_addr_state(cmd, enc_info, is_low_delay);
+      vdenc_buf.ColocatedMVReadBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.ColocatedMVReadBuffer.Address.bo, 0),
+      };
+
+      vdenc_buf.FWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.FWDREF0.Address.bo, 0),
+      };
+
+      if (ref_iv[1])
+         vdenc_buf.FWDREF1.Address =
+               anv_image_dpb_address(ref_iv[1], ref_layer[1]);
+
+      vdenc_buf.FWDREF1.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.FWDREF1.Address.bo, 0),
+      };
+
+      if (ref_iv[2])
+         vdenc_buf.FWDREF2.Address =
+               anv_image_dpb_address(ref_iv[2], ref_layer[2]);
+
+      vdenc_buf.FWDREF2.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.FWDREF2.Address.bo, 0),
+      };
+
+      if (bwd_ref_iv)
+         vdenc_buf.BWDREF0.Address =
+               anv_image_dpb_address(bwd_ref_iv, bwd_ref_layer);
+
+      vdenc_buf.BWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.BWDREF0.Address.bo, 0),
+      };
 
       if (brc_enabled) {
+         vdenc_buf.VDEncStatisticsStreamOut.Address =
+            /* Same as the PAK statistics: the HuC reads the previous
+             * frame's VDEnc statistics from this buffer.
+             */
+            anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_VDENC_STATS_STREAMOUT, 0);
+      }
+      vdenc_buf.VDEncStatisticsStreamOut.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.VDEncStatisticsStreamOut.Address.bo, 0),
+      };
+
+      vdenc_buf.DSFWDREF04X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.DSFWDREF14X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#if GFX_VERx10 < 125
+      vdenc_buf.VDEncCURecordStreamOutBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#else
+      vdenc_buf.DSBWDREF04X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#endif
+      vdenc_buf.VDEncLCUPAK_OBJ_CMDBuffer.Address =
+         anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_MB_CODE, vid->h265_slot);
+      vdenc_buf.VDEncLCUPAK_OBJ_CMDBuffer.PictureFields =
+         (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+            .MOCS = anv_mocs(cmd->device, vdenc_buf.VDEncLCUPAK_OBJ_CMDBuffer.Address.bo, 0),
+         };
+      vdenc_buf.ScaledReferenceSurface8X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.ScaledReferenceSurface4X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VP9SegmentationMapStreamInBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VP9SegmentationMapStreamOutBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VDEncTileRowStoreBuffer.Address =
+         anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_VDENC_TILE_ROW_STORE, vid->h265_slot);
+      vdenc_buf.VDEncTileRowStoreBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.VDEncTileRowStoreBuffer.Address.bo, 0),
+      };
+      vdenc_buf.VDEncCumulativeCUCountStreamOutSurface.Address =
+         anv_video_h265_line_addr(vid, ANV_VID_MEM_H265_VDENC_CUMULATIVE_CU_COUNT, vid->h265_slot);
+      vdenc_buf.VDEncCumulativeCUCountStreamOutSurface.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.VDEncCumulativeCUCountStreamOutSurface.Address.bo, 0),
+      };
+      vdenc_buf.VDEncPaletteModeStreamOutSurface.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+
+#if GFX_VERx10 >= 125
+      vdenc_buf.IntraPredictionRowStoreBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.ColocatedMVAVCWriteBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.Additional4XDSFWDREF.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+#endif
+
+      /* Current-frame DS write (8x = stage1, 4x = stage2) plus L0/L1 HME
+       * refs. media-driver binds these even when HME prefetch is off.
+       */
+      if (has_ds) {
+         anv_vdenc_bind_ds_pic(&vdenc_buf.ScaledReferenceSurface8X, cmd,
+                               base_ref_iv, base_ref_array_layer, true);
+         anv_vdenc_bind_ds_pic(&vdenc_buf.ScaledReferenceSurface4X, cmd,
+                               base_ref_iv, base_ref_array_layer, false);
+         anv_vdenc_bind_ds_pic(&vdenc_buf.DSFWDREF0, cmd, ref_iv[0], ref_layer[0], true);
+         anv_vdenc_bind_ds_pic(&vdenc_buf.DSFWDREF1, cmd, ref_iv[1], ref_layer[1], true);
+         anv_vdenc_bind_ds_pic(&vdenc_buf.DSFWDREF04X, cmd, ref_iv[0], ref_layer[0], false);
+         anv_vdenc_bind_ds_pic(&vdenc_buf.DSFWDREF14X, cmd, ref_iv[1], ref_layer[1], false);
+#if GFX_VERx10 >= 125
+         anv_vdenc_bind_ds_pic(&vdenc_buf.DSBWDREF0, cmd, bwd_ref_iv, bwd_ref_layer, true);
+         anv_vdenc_bind_ds_pic(&vdenc_buf.DSBWDREF04X, cmd, bwd_ref_iv, bwd_ref_layer, false);
+         anv_vdenc_bind_ds_pic(&vdenc_buf.Additional4XDSFWDREF, cmd,
+                               ref_iv[2], ref_layer[2], false);
+#endif
+      }
+   }
+
+   if (!brc_enabled)
+      anv_h265_emit_vdenc_cmd1(cmd, NULL, enc_info);
+
+
+   uint32_t frame_width_in_min_cb = sps->pic_width_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t frame_height_in_min_cb = sps->pic_height_in_luma_samples >> (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t width_in_pix = frame_width_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t height_in_pix = frame_height_in_min_cb << (sps->log2_min_luma_coding_block_size_minus3 + 3);
+
+   if (!brc_enabled) {
+      anv_h265_emit_hcp_pic_state(cmd, NULL, enc_info, false);
+
+      anv_h265_emit_vdenc_cmd2(cmd, NULL, enc_info, dpb_idx, is_low_delay);
+
+      anv_h265_emit_rdoq_state(&cmd->batch, is_i_frame,
+                               sps->bit_depth_luma_minus8 + 8, false);
+   } else {
+      /* Copy the HuC produced second level batch into the host visible marker
+       * BO before jumping into it, so a hang inside it can be inspected.
+       */
+      if (vid->brc_marker_bo != NULL) {
+         struct anv_address src = anv_brc_exec_slb_addr(vid);
+         struct anv_address dst = (struct anv_address) { vid->brc_marker_bo, 4096 };
+
+         for (uint32_t i = 0; i < 1024; i++) {
+            anv_batch_emit(&cmd->batch, GENX(MI_COPY_MEM_MEM), cp) {
+               cp.DestinationMemoryAddress = anv_address_add(dst, i * 4);
+               cp.SourceMemoryAddress = anv_address_add(src, i * 4);
+            }
+         }
+      }
+
+      anv_h265_emit_rdoq_state(&cmd->batch, is_i_frame,
+                               sps->bit_depth_luma_minus8 + 8, false);
+
+      anv_h265_brc_marker(cmd, 0x300 | (vid->rc.frame_counter & 0xff));
+
+      anv_batch_emit(&cmd->batch, GENX(MI_BATCH_BUFFER_START), bbs) {
+         bbs.SecondLevelBatchBuffer = Secondlevelbatch;
+         bbs.AddressSpaceIndicator = ASI_PPGTT;
+         bbs.BatchBufferStartAddress =
+            anv_address_add(anv_brc_exec_slb_addr(vid),
+                            ANV_H265_BRC_SLB_GROUP1_SIZE);
+      }
+
+      anv_h265_brc_marker(cmd, 0x500 | (vid->rc.frame_counter & 0xff));
+   }
+
+
+   uint32_t ctb_size = 1 << (sps->log2_diff_max_min_luma_coding_block_size +
+       sps->log2_min_luma_coding_block_size_minus3 + 3);
+   uint32_t ctb_w = DIV_ROUND_UP(width_in_pix, ctb_size);
+   uint32_t ctb_h = DIV_ROUND_UP(height_in_pix, ctb_size);
+   uint32_t total_ctu = ctb_w * ctb_h;
+   const uint32_t n_slices = frame_info->naluSliceSegmentEntryCount;
+
+   for (uint32_t slice_id = 0; slice_id < n_slices; slice_id++) {
+      const VkVideoEncodeH265NaluSliceSegmentInfoKHR *nalu = &frame_info->pNaluSliceSegmentEntries[slice_id];
+      StdVideoEncodeH265SliceSegmentHeader slice_header_tmp = *nalu->pStdSliceSegmentHeader;
+      StdVideoEncodeH265SliceSegmentHeader *slice_header = &slice_header_tmp;
+
+      bool is_last = (slice_id == n_slices - 1);
+      uint32_t slice_type = slice_header->slice_type;
+      if (getenv("ANV_BRC_DEBUG_PICTYPE"))
+         fprintf(stderr, "H265 slice fc=%u id=%u slice_type=%u\n",
+                 vid->rc.frame_counter, slice_id, slice_type);
+      int32_t slice_qp = rc_disable ? nalu->constantQp : pps->init_qp_minus26 + 26;
+      slice_qp = CLAMP(slice_qp, 10, 51);
+      int32_t slice_qp_delta = slice_qp - (pps->init_qp_minus26 + 26);
+      uint32_t slice_addr = slice_header->slice_segment_address;
+      uint32_t next_addr = is_last ? total_ctu :
+         frame_info->pNaluSliceSegmentEntries[slice_id + 1]
+            .pStdSliceSegmentHeader->slice_segment_address;
+
+      assert(slice_addr < next_addr && next_addr <= total_ctu);
+      assert(slice_id != 0 || slice_addr == 0);
+      slice_header->flags.first_slice_segment_in_pic_flag = (slice_id == 0);
+      if (!sps->flags.sample_adaptive_offset_enabled_flag) {
+         slice_header->flags.slice_sao_luma_flag = 0;
+         slice_header->flags.slice_sao_chroma_flag = 0;
+      }
+      if (!pps->flags.cabac_init_present_flag ||
+          slice_type == STD_VIDEO_H265_SLICE_TYPE_I)
+         slice_header->flags.cabac_init_flag = 0;
+      if (!pps->flags.pps_slice_chroma_qp_offsets_present_flag) {
+         slice_header->slice_cb_qp_offset = 0;
+         slice_header->slice_cr_qp_offset = 0;
+      }
+      if (!pps->flags.dependent_slice_segments_enabled_flag)
+         slice_header->flags.dependent_slice_segment_flag = 0;
+      if (!pps->flags.deblocking_filter_override_enabled_flag ||
+          !slice_header->flags.deblocking_filter_override_flag) {
+         slice_header->flags.slice_deblocking_filter_disabled_flag =
+            pps->flags.pps_deblocking_filter_disabled_flag;
+         slice_header->slice_beta_offset_div2 = pps->pps_beta_offset_div2;
+         slice_header->slice_tc_offset_div2 = pps->pps_tc_offset_div2;
+      }
+      if (!pps->flags.pps_loop_filter_across_slices_enabled_flag)
+         slice_header->flags.slice_loop_filter_across_slices_enabled_flag = 0;
+      if (slice_type == STD_VIDEO_H265_SLICE_TYPE_P)
+         slice_header->flags.collocated_from_l0_flag = 1;
+      assert(slice_header->MaxNumMergeCand >= 1 &&
+             slice_header->MaxNumMergeCand <= 5);
+
+      if (slice_type != STD_VIDEO_H265_SLICE_TYPE_I) {
+         if (pps->num_ref_idx_l0_default_active_minus1 != ref_lists->num_ref_idx_l0_active_minus1 ||
+             (slice_type == STD_VIDEO_H265_SLICE_TYPE_B &&
+              pps->num_ref_idx_l1_default_active_minus1 != ref_lists->num_ref_idx_l1_active_minus1)) {
+            slice_header->flags.num_ref_idx_active_override_flag = true;
+         }
+
+         anv_batch_emit(&cmd->batch, GENX(HCP_REF_IDX_STATE), ref) {
+            ref.ReferencePictureListSelect = 0;
+            ref.NumberofReferenceIndexesActive = ref_lists->num_ref_idx_l0_active_minus1;
+
+            for (uint32_t i = 0; i < ref_lists->num_ref_idx_l0_active_minus1 + 1; i++) {
+               uint8_t slot = ref_lists->RefPicList0[i];
+               bool long_term = false;
+
+               if (slot == STD_VIDEO_H265_NO_REFERENCE_PICTURE)
+                  continue;
+
+               int32_t ref_poc = anv_h265_get_ref_poc(enc_info, slot, &long_term);
+               int64_t diff_poc = (int64_t)pic_info.PicOrderCntVal - ref_poc;
+
+               ref.ReferenceListEntry[i].ListEntry = dpb_idx[slot];
+               ref.ReferenceListEntry[i].ReferencePicturetbValue = CLAMP(diff_poc, -128, 127) & 0xff;
+               ref.ReferenceListEntry[i].LongTermReference = long_term;
+               ref.ReferenceListEntry[i].TopField = true;
+            }
+         }
+      }
+
+      if (slice_type == STD_VIDEO_H265_SLICE_TYPE_B) {
+         anv_batch_emit(&cmd->batch, GENX(HCP_REF_IDX_STATE), ref) {
+            ref.ReferencePictureListSelect = 1;
+            ref.NumberofReferenceIndexesActive = ref_lists->num_ref_idx_l1_active_minus1;
+
+            for (uint32_t i = 0; i < ref_lists->num_ref_idx_l1_active_minus1 + 1; i++) {
+               uint8_t slot = ref_lists->RefPicList1[i];
+               bool long_term = false;
+
+               if (slot == STD_VIDEO_H265_NO_REFERENCE_PICTURE)
+                  continue;
+
+               int32_t ref_poc = anv_h265_get_ref_poc(enc_info, slot, &long_term);
+               int64_t diff_poc = (int64_t)pic_info.PicOrderCntVal - ref_poc;
+
+               ref.ReferenceListEntry[i].ListEntry = dpb_idx[slot];
+               ref.ReferenceListEntry[i].ReferencePicturetbValue = CLAMP(diff_poc, -128, 127) & 0xff;
+               ref.ReferenceListEntry[i].LongTermReference = long_term;
+               ref.ReferenceListEntry[i].TopField = true;
+            }
+         }
+      }
+
+      if (brc_enabled) {
+         if (slice_id == 0 && getenv("ANV_BRC_DEBUG_PAKHDR")) {
+            uint8_t nal[512] = { 0, };
+            size_t vps_size = 0, sps_size = 0, pps_size = 0;
+            vk_video_encode_h265_vps(vps, sizeof(nal), &vps_size, nal);
+            vk_video_encode_h265_sps(sps, sizeof(nal) - vps_size,
+                                     &sps_size, nal + vps_size);
+            vk_video_encode_h265_pps(pps, sizeof(nal) - vps_size - sps_size,
+                                     &pps_size, nal + vps_size + sps_size);
+            uint32_t bits = (uint32_t)(vps_size + sps_size + pps_size) * 8;
+            uint32_t len_dw = align(bits, 32) >> 5;
+            uint32_t bits_last = bits & 0x1f;
+            uint32_t *dw = anv_batch_emitn(&cmd->batch, len_dw + 2,
+                  GENX(HCP_PAK_INSERT_OBJECT),
+                  .LastHeader = false,
+                  .DataBitsInLastDW = bits_last ? bits_last : 32,
+                  .SliceHeaderIndicator = false,
+                  .HeaderLengthExcludedFromSize = ACCUMULATE);
+            memcpy(dw + 2, nal, vps_size + sps_size + pps_size);
+         }
+
+         anv_h265_brc_marker(cmd, 0x700 | (vid->rc.frame_counter << 8) | slice_id);
          anv_batch_emit(&cmd->batch, GENX(MI_BATCH_BUFFER_START), bbs) {
             bbs.SecondLevelBatchBuffer = Secondlevelbatch;
             bbs.AddressSpaceIndicator = ASI_PPGTT;
             bbs.BatchBufferStartAddress =
-               anv_address_add(ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_EXEC_SLB),
-                               ANV_H265_BRC_SLB_GROUP1_SIZE);
+               anv_address_add(anv_brc_exec_slb_addr(vid),
+                               slb_layout.slice_start[slice_id]);
          }
+
+#if GFX_VERx10 >= 125
+         anv_h265_brc_marker(cmd, 0x800 | (vid->rc.frame_counter << 8) | slice_id);
+         if (!getenv("ANV_BRC_DEBUG_SKIP_PART2")) anv_batch_emit(&cmd->batch, GENX(MI_BATCH_BUFFER_START), bbs) {
+            bbs.SecondLevelBatchBuffer = Secondlevelbatch;
+            bbs.AddressSpaceIndicator = ASI_PPGTT;
+            bbs.BatchBufferStartAddress =
+               anv_address_add(anv_brc_exec_slb_addr(vid),
+                               slb_layout.slice_data_start[slice_id]);
+         }
+#endif
+         anv_h265_brc_marker(cmd, 0x900 | (vid->rc.frame_counter << 8) | slice_id);
       } else {
-         anv_h265_emit_vdenc_cmd1(cmd, NULL, enc_info);
-         anv_h265_emit_hcp_pic_state(cmd, NULL, enc_info, false);
-         anv_h265_emit_vdenc_cmd2(cmd, NULL, enc_info, dpb_idx, is_low_delay);
-#if GFX_VER >= 20
-         /* Xe2 VDEnc expects the RDOQ lambda table command to be programmed. */
-         anv_h265_emit_rdoq_state(&cmd->batch,
-                                  anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0,
-                                  sps->bit_depth_luma_minus8 + 8, false);
-#endif
-      }
+         uint8_t chroma_log2_weight_denom = 0;
 
-      for (uint32_t slice_id = 0; slice_id < frame_info->naluSliceSegmentEntryCount; slice_id++) {
-         StdVideoEncodeH265SliceSegmentHeader *slice_header =
-            (StdVideoEncodeH265SliceSegmentHeader *)frame_info->pNaluSliceSegmentEntries[slice_id].pStdSliceSegmentHeader;
-         uint32_t slice_type = slice_header->slice_type % 5;
+         if ((pps->flags.weighted_pred_flag && (slice_type == STD_VIDEO_H265_SLICE_TYPE_P)) ||
+               (pps->flags.weighted_bipred_flag && (slice_type == STD_VIDEO_H265_SLICE_TYPE_B))) {
+            assert (slice_header->pWeightTable);
 
-         if (slice_type == STD_VIDEO_H265_SLICE_TYPE_P)
-            slice_header->slice_type = slice_type = STD_VIDEO_H265_SLICE_TYPE_B;
+            uint16_t chroma_weight, chroma_offset;
+            const StdVideoEncodeH265WeightTable *w_tbl = slice_header->pWeightTable;
+            chroma_log2_weight_denom = w_tbl->luma_log2_weight_denom + w_tbl->delta_chroma_log2_weight_denom;
 
-         if (slice_type != STD_VIDEO_H265_SLICE_TYPE_I &&
-             (pps->num_ref_idx_l0_default_active_minus1 != ref_lists->num_ref_idx_l0_active_minus1 ||
-              pps->num_ref_idx_l1_default_active_minus1 != ref_lists->num_ref_idx_l1_active_minus1))
-            slice_header->flags.num_ref_idx_active_override_flag = true;
+            anv_batch_emit(&cmd->batch, GENX(HCP_WEIGHTOFFSET_STATE), w) {
+               w.ReferencePictureListSelect = 0;
 
-         anv_h265_emit_hcp_ref_idx_state(cmd, enc_info, slice_id, dpb_idx);
+               for (unsigned i = 0; i < STD_VIDEO_H265_MAX_NUM_LIST_REF; i++) {
 
-         if (brc_enabled) {
-            anv_batch_emit(&cmd->batch, GENX(MI_BATCH_BUFFER_START), bbs) {
-               bbs.SecondLevelBatchBuffer = Secondlevelbatch;
-               bbs.AddressSpaceIndicator = ASI_PPGTT;
-               bbs.BatchBufferStartAddress =
-                  anv_address_add(ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_EXEC_SLB),
-                                  slb_layout.slice_start[slice_id]);
+                  w.LumaOffsets[i].DeltaLumaWeightLX = w_tbl->delta_luma_weight_l0[i] & 0xff;
+                  w.LumaOffsets[i].LumaOffsetLX = w_tbl->luma_offset_l0[i] & 0xff;
+                  w.ChromaOffsets[i].DeltaChromaWeightLX0 = w_tbl->delta_chroma_weight_l0[i][0] & 0xff;
+                  w.ChromaOffsets[i].DeltaChromaWeightLX1 = w_tbl->delta_chroma_weight_l0[i][1] & 0xff;
+
+
+                  chroma_weight = (1 << chroma_log2_weight_denom) + w_tbl->delta_chroma_weight_l0[i][0];
+                  chroma_offset = CLAMP(w_tbl->delta_chroma_offset_l0[i][0] -
+                     ((128 * chroma_weight) >> chroma_log2_weight_denom) + 128, -128, 127);
+                  w.ChromaOffsets[i].ChromaOffsetLX0 = chroma_offset & 0xff;
+
+                  chroma_weight = (1 << chroma_log2_weight_denom) + w_tbl->delta_chroma_weight_l0[i][1];
+                  chroma_offset = CLAMP(w_tbl->delta_chroma_offset_l0[i][1] -
+                     ((128 * chroma_weight) >> chroma_log2_weight_denom) + 128, -128, 127);
+                  w.ChromaOffsets[i].ChromaOffsetLX1 = chroma_offset & 0xff;
+               }
             }
-#if GFX_VERx10 >= 125
-            anv_batch_emit(&cmd->batch, GENX(MI_BATCH_BUFFER_START), bbs) {
-               bbs.SecondLevelBatchBuffer = Secondlevelbatch;
-               bbs.AddressSpaceIndicator = ASI_PPGTT;
-               bbs.BatchBufferStartAddress =
-                  anv_address_add(ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_BRC_EXEC_SLB),
-                                  slb_layout.slice_data_start[slice_id]);
+
+            if (slice_type == STD_VIDEO_H265_SLICE_TYPE_B) {
+               anv_batch_emit(&cmd->batch, GENX(HCP_WEIGHTOFFSET_STATE), w) {
+                  w.ReferencePictureListSelect = 1;
+
+                  for (unsigned i = 0; i < STD_VIDEO_H265_MAX_NUM_LIST_REF; i++) {
+                     w.LumaOffsets[i].DeltaLumaWeightLX = w_tbl->delta_luma_weight_l1[i] & 0xff;
+                     w.LumaOffsets[i].LumaOffsetLX = w_tbl->luma_offset_l1[i] & 0xff;
+                     w.ChromaOffsets[i].DeltaChromaWeightLX0 = w_tbl->delta_chroma_weight_l1[i][0] & 0xff;
+                     w.ChromaOffsets[i].DeltaChromaWeightLX1 = w_tbl->delta_chroma_weight_l1[i][1] & 0xff;
+
+                     chroma_weight = (1 << chroma_log2_weight_denom) + w_tbl->delta_chroma_weight_l1[i][0];
+                     chroma_offset = CLAMP(w_tbl->delta_chroma_offset_l1[i][0] -
+                        ((128 * chroma_weight) >> chroma_log2_weight_denom) + 128, -128, 127);
+                     w.ChromaOffsets[i].ChromaOffsetLX0 = chroma_offset & 0xff;
+
+                     chroma_weight = (1 << chroma_log2_weight_denom) + w_tbl->delta_chroma_weight_l1[i][1];
+                     chroma_offset = CLAMP(w_tbl->delta_chroma_offset_l1[i][1] -
+                        ((128 * chroma_weight) >> chroma_log2_weight_denom) + 128, -128, 127);
+                     w.ChromaOffsets[i].ChromaOffsetLX1 = chroma_offset & 0xff;
+                  }
+               }
             }
-#endif
-         } else {
-            anv_h265_emit_hcp_weightoffset_state(cmd, NULL, enc_info, slice_id);
-            anv_h265_emit_hcp_slice_state(cmd, NULL, enc_info, slice_id, dpb_idx, false, is_low_delay);
-            anv_h265_emit_slice_header(cmd, NULL, enc_info, slice_id);
-            anv_vdenc_emit_weightsoffsets_state(cmd, NULL, false);
          }
-#if GFX_VERx10 >= 125
-         anv_h265_emit_vdenc_tile_slice_state(cmd, enc_info, slice_id);
-#endif
-         anv_h265_emit_vdenc_walker_state(cmd, enc_info, slice_id);
-         anv_vdenc_emit_vd_pipeline_flush(cmd);
+
+         uint8_t slice_header_data[256] = { 0, };
+         size_t slice_header_data_len_in_bytes = 0;
+         vk_video_encode_h265_slice_header(&pic_info,
+                                           vps,
+                                           sps,
+                                           pps,
+                                           slice_header,
+                                           slice_qp_delta,
+                                           &slice_header_data_len_in_bytes,
+                                           &slice_header_data);
+         uint32_t slice_header_data_len_in_bits = slice_header_data_len_in_bytes * 8;
+
+         anv_batch_emit(&cmd->batch, GENX(HCP_SLICE_STATE), slice) {
+            slice.SliceHorizontalPosition = slice_addr % ctb_w;
+            slice.SliceVerticalPosition = slice_addr / ctb_w;
+
+            if (is_last) {
+               slice.NextSliceHorizontalPosition = 0;
+               slice.NextSliceVerticalPosition = 0;
+            } else {
+               slice.NextSliceHorizontalPosition = next_addr % ctb_w;
+               slice.NextSliceVerticalPosition = next_addr / ctb_w;
+            }
+
+            slice.SliceType = slice_type;
+            slice.LastSlice = is_last;
+            slice.DependentSlice = slice_header->flags.dependent_slice_segment_flag;
+            slice.SliceTemporalMVPEnable = !is_i_frame &&
+               pic_info.flags.slice_temporal_mvp_enabled_flag;
+            slice.SliceQP = slice_qp;
+            slice.SliceCbQPOffset = slice_header->slice_cb_qp_offset;
+            slice.SliceCrQPOffset = slice_header->slice_cr_qp_offset;
+            slice.SliceHeaderDisableDeblockingFilter = slice_header->flags.slice_deblocking_filter_disabled_flag;
+            slice.SliceTCOffsetDiv2 = slice_header->slice_tc_offset_div2;
+            slice.SliceBetaOffsetDiv2 = slice_header->slice_beta_offset_div2;
+            slice.SliceLoopFilterEnable = slice_header->flags.slice_loop_filter_across_slices_enabled_flag;
+            slice.SliceSAOChroma = sps->flags.sample_adaptive_offset_enabled_flag &&
+               slice_header->flags.slice_sao_chroma_flag;
+            slice.SliceSAOLuma = sps->flags.sample_adaptive_offset_enabled_flag &&
+               slice_header->flags.slice_sao_luma_flag;
+            slice.MVDL1Zero = 0; /* Only for decoder */
+            slice.CollocatedFromL0 = is_p_frame ? true :
+               slice_header->flags.collocated_from_l0_flag;
+            slice.LowDelay = is_low_delay;
+
+            if (slice_type != STD_VIDEO_H265_SLICE_TYPE_I && slice_header->pWeightTable) {
+               slice.Log2WeightDenominatorChroma = slice_header->pWeightTable->luma_log2_weight_denom +
+                  (chroma_log2_weight_denom - slice_header->pWeightTable->luma_log2_weight_denom);
+               slice.Log2WeightDenominatorLuma = slice_header->pWeightTable->luma_log2_weight_denom;
+            }
+            slice.CABACInit = slice_header->flags.cabac_init_flag;
+            slice.MaxMergeIndex = slice_header->MaxNumMergeCand - 1;
+
+            if (slice.SliceTemporalMVPEnable) {
+               const uint8_t *list = slice.CollocatedFromL0 ?
+                  ref_lists->RefPicList0 : ref_lists->RefPicList1;
+               slice.CollocatedMVTemporalBufferIndex =
+                  dpb_idx[list[slice_header->collocated_ref_idx]];
+            }
+            assert(slice.CollocatedMVTemporalBufferIndex < ANV_VIDEO_H265_HCP_NUM_REF_FRAME);
+
+            /* For VDEnc mode */
+            slice.RoundInter = 4;
+            slice.RoundIntra = 10;
+
+            {
+               uint8_t sh_data[256] = { 0, };
+               size_t sh_len = 0;
+               uint32_t sh_qp_delta =
+                  anv_h265_slice_qp(cmd, enc_info, slice_id) - (pps->init_qp_minus26 + 26);
+
+               vk_video_encode_h265_slice_header(frame_info->pStdPictureInfo,
+                                                 anv_h265_vps(cmd, enc_info),
+                                                 anv_h265_sps(cmd, enc_info),
+                                                 anv_h265_pps(cmd, enc_info),
+                                                 slice_header, sh_qp_delta,
+                                                 &sh_len, &sh_data);
+               slice.SliceHeaderLength = sh_len ? (sh_len - 1) * 8 : 0;
+            }
+            slice.CABACZeroWordInsertionEnable = false;
+            slice.EmulationByteSliceInsertEnable = true;
+            slice.TailInsertionPresent = false;
+            slice.SliceDataInsertionPresent = true;
+            slice.HeaderInsertionPresent = true;
+
+            slice.IndirectPAKBSEDataStartOffset = 0;
+            slice.TransformSkipLambda = hcp_transform_skip_lambda_tbl[slice_qp];
+
+            int qp_idx = 0;
+            if (slice_qp <= 22) {
+               qp_idx = 0;
+            } else if (slice_qp <= 27) {
+               qp_idx = 1;
+            } else if (slice_qp <= 32) {
+               qp_idx = 2;
+            } else {
+               qp_idx = 3;
+            }
+
+            if (anv_vdenc_h265_picture_type(frame_info->pStdPictureInfo->pic_type) == 0) {
+               slice.TransformSkipNumberofZeroCoeffsFactor0 = hcp_transform_skip_coeffs_tbl[qp_idx][0][0][0][0];
+               slice.TransformSkipNumberofZeroCoeffsFactor1 = hcp_transform_skip_coeffs_tbl[qp_idx][0][0][1][0];
+               slice.TransformSkipNumberofNonZeroCoeffsFactor0 = hcp_transform_skip_coeffs_tbl[qp_idx][0][0][0][1] + 32;
+               slice.TransformSkipNumberofNonZeroCoeffsFactor1 = hcp_transform_skip_coeffs_tbl[qp_idx][0][0][1][1] + 32;
+            } else {
+               slice.TransformSkipNumberofZeroCoeffsFactor0 = hcp_transform_skip_coeffs_tbl[qp_idx][1][0][0][0];
+               slice.TransformSkipNumberofZeroCoeffsFactor1 = hcp_transform_skip_coeffs_tbl[qp_idx][1][0][1][0];
+               slice.TransformSkipNumberofNonZeroCoeffsFactor0 = hcp_transform_skip_coeffs_tbl[qp_idx][1][0][0][1] + 32;
+               slice.TransformSkipNumberofNonZeroCoeffsFactor1 = hcp_transform_skip_coeffs_tbl[qp_idx][1][0][1][1] + 32;
+            }
+
+            slice.OriginalSliceStartCtbX = slice_addr % ctb_w;
+            slice.OriginalSliceStartCtbY = slice_addr / ctb_w;
+         }
+
+         uint32_t *dw;
+         uint32_t length_in_dw;
+         uint32_t data_bits_in_last_dw;
+
+         length_in_dw = align((uint32_t)slice_header_data_len_in_bits, 32) >> 5;
+         data_bits_in_last_dw = slice_header_data_len_in_bits & 0x1f;
+
+         dw = anv_batch_emitn(&cmd->batch, length_in_dw + 2, GENX(HCP_PAK_INSERT_OBJECT),
+               .LastHeader = true,
+               .DataBitsInLastDW = data_bits_in_last_dw > 0 ? data_bits_in_last_dw : 32,
+               /* media-driver maps this bit to bResetBitstreamStartingPos.
+                * Keep it clear so later slices append instead of overwrite.
+                */
+               .SliceHeaderIndicator = false,
+               .HeaderLengthExcludedFromSize =  ACCUMULATE);
+
+         memcpy(dw + 2, slice_header_data, length_in_dw * 4);
+
+         anv_batch_emit(&cmd->batch, GENX(VDENC_WEIGHTSOFFSETS_STATE), vdenc_offsets) {
+            vdenc_offsets.WeightsForwardReference0 = 1;
+            vdenc_offsets.WeightsForwardReference1 = 1;
+            vdenc_offsets.WeightsForwardReference2 = 1;
+            vdenc_offsets.HEVCVP9WeightsBackwardReference0 = 1;
+         }
       }
 
-      anv_video_emit_mi_flush_dw(cmd, true);
-      anv_h265_emit_hcp_pipeline_flush(cmd);
-      anv_video_emit_mi_flush_dw(cmd, false);
 
-      if (brc_enabled) {
-         anv_h265_brc_store_pak_stats(cmd);
-         vid->rc.frame_counter++;
+#if GFX_VERx10 >= 125
+       /* TODO: Different setting according to the target usage;
+        * SCC (palette/IBC) and bit-depth > 8 adjustments;
+        * per-tile origin/size/offsets once multi-tile is supported.
+        */
+      uint32_t qp_idx = slice_qp <= 12 ? 0 : slice_qp <= 17 ? 1 : slice_qp <= 22 ? 2 :
+                        slice_qp <= 27 ? 3 : slice_qp <= 32 ? 4 : slice_qp <= 37 ? 5 :
+                        slice_qp <= 42 ? 6 : slice_qp <= 47 ? 7 : slice_qp <= 49 ? 8 : 9;
+      const uint32_t *param = h265_vdenc_hevc_tile_slice_params[1][qp_idx];
+
+      anv_batch_emit(&cmd->batch, GENX(VDENC_HEVC_VP9_TILE_SLICE_STATE), til) {
+         til.NumParEngine = 0;
+         til.TileWidth = width_in_pix - 1;
+         til.TileHeight = height_in_pix - 1;
+
+         til.TileSliceParam0  = 0;
+         til.TileSliceParam1  = param[7];
+#if GFX_VER >= 20
+         /* VdencHEVCVP9TileSlicePar4 in encode_hevc_vdenc_scc_xe2_hpm.cpp */
+         til.TileSliceParam2  = 6;
+#else
+         til.TileSliceParam2  = 0;
+#endif
+         til.TileSliceParam3  = param[9];
+         til.TileSliceParam4  = param[8];
+         til.TileSliceParam5  = 1;
+         til.TileSliceParam6  = param[4];
+         til.TileSliceParam7  = param[2];
+         til.TileSliceParam8  = param[3];
+         til.TileSliceParam9  = param[1];
+         til.TileSliceParam10 = param[5];
+         til.TileSliceParam11 = 2;
+         til.TileSliceParam12 = 72;
+         til.TileSliceParam13 = 1;
+         til.TileSliceParam14 = 0;
+         til.TileSliceParam15 = param[0];
+         til.TileSliceParam16 = 63;
+         til.TileSliceParam17 = 63;
+         til.TileSliceParam18 = 63;
+         til.TileSliceParam19 = 6;
+         til.TileSliceParam20 = 0x5;
+      }
+#endif
+
+      anv_batch_emit(&cmd->batch, GENX(VDENC_WALKER_STATE), vdenc_walker) {
+         vdenc_walker.MBLCUStartXPosition = slice_addr % ctb_w;
+         vdenc_walker.MBLCUStartYPosition = slice_addr / ctb_w;
+         /* media-driver HevcEncodeTile, tiling off:
+          * next X = (addr+count)/heightInCtb, next Y = (addr+count)/widthInCtb.
+          */
+         vdenc_walker.NextSliceMBLCUStartXPosition =
+            next_addr / ctb_h;
+         vdenc_walker.NextSliceMBStartYPosition = next_addr / ctb_w;
+#if GFX_VERx10 < 125
+         vdenc_walker.TileWidth = width_in_pix - 1;
+         vdenc_walker.TileHeight = height_in_pix - 1;
+#endif
+      }
+
+      anv_batch_emit(&cmd->batch, GENX(VD_PIPELINE_FLUSH), flush) {
+         flush.MFXPipelineDone = true;
+         flush.VDENCPipelineDone = true;
+         flush.VDENCPipelineCommandFlush = true;
+         flush.VDCommandMessageParserDone = true;
       }
    }
+
+   }
+
+   if (brc_enabled) {
+      anv_h265_brc_store_pak_stats(cmd);
+      vid->rc.frame_counter++;
+   }
+
+
+   anv_batch_emit(&cmd->batch, GENX(MI_FLUSH_DW), flush) {
+      flush.VideoPipelineCacheInvalidate = 1;
+   };
+
+   anv_batch_emit(&cmd->batch, GENX(VD_CONTROL_STATE), v) {
+      v.VDControlState.MemoryImplicitFlush = true;
+#if GFX_VERx10 >= 125
+      v.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd->device->info, 16021867713);
+#endif
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(VD_PIPELINE_FLUSH), flush) {
+      flush.HEVCPipelineDone = true;
+      flush.HEVCPipelineCommandFlush = true;
+      flush.VDCommandMessageParserDone = true;
+   }
+
+   anv_h265_brc_marker(cmd, 0x600 | (vid->rc.frame_counter & 0xff));
+
+   if (brc_enabled && getenv("ANV_BRC_DEBUG_PAKINT")) {
+      /* HuC PAK integrate kernel: media-driver runs it after the main encode
+       * to aggregate the PAK statistics and emit the BRC data.
+       */
+      struct anv_state dmem_state =
+         anv_cmd_buffer_alloc_temporary_state(cmd,
+            sizeof(struct anv_huc_pak_integrate_dmem), 64);
+      if (dmem_state.map != NULL) {
+         anv_h265_brc_fill_pak_integrate_dmem(
+            sps, frame_info->naluSliceSegmentEntryCount, dmem_state.map);
+
+         struct anv_address bitstream_addr =
+            anv_address_add(dst_buffer->address,
+                            align(enc_info->dstBufferOffset, 4096));
+
+         anv_h265_brc_emit_pak_integrate(cmd, dmem_state, bitstream_addr);
+         anv_h265_brc_marker(cmd, 0x7000 | (vid->rc.frame_counter & 0xff));
+      }
+   }
+
+   anv_batch_emit(&cmd->batch, GENX(MI_FLUSH_DW), flush) {
+      flush.VideoPipelineCacheInvalidate = 0;
+   };
+
+   anv_h265_brc_marker(cmd, 0x400 | (vid->rc.frame_counter & 0xff));
+
 #endif // GFX_VER >= 12
+
 }
 
 #define AVP_BITSTREAM_BYTECOUNT_TILE_NOHEADER_REG 0x1C2B4C
 #define AVP_BITSTREAM_BYTECOUNT_TILE_REG          0x1C2B48
+
+
 
 static void
 anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc_info)
@@ -4200,10 +4623,12 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
       }
    }
 
+   bool rc_disable = vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+
    bool is_intra = pic_info->frame_type == STD_VIDEO_AV1_FRAME_TYPE_KEY ||
                    pic_info->frame_type == STD_VIDEO_AV1_FRAME_TYPE_INTRA_ONLY;
-   uint32_t base_q_idx = anv_video_encode_quantizer(vid, frame_info->constantQIndex,
-      pic_info->pQuantization ? pic_info->pQuantization->base_q_idx : 0);
+   uint32_t base_q_idx = rc_disable ? frame_info->constantQIndex :
+      (pic_info->pQuantization ? pic_info->pQuantization->base_q_idx : 0);
 
    if (base_q_idx == 0) base_q_idx = 1;
    bool reference_select = !is_intra &&
@@ -4327,66 +4752,102 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
    /* TODO: VDENC_DS_REF_SURFACE_STATE (8X/4X downscaled) - needs DS scratch surface allocation */
 
    anv_batch_emit(&cmd->batch, GENX(VDENC_PIPE_BUF_ADDR_STATE), vdenc_buf) {
-      vdenc_buf.DSFWDREF0.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.DSFWDREF1.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.DSBWDREF0.PictureFields = ANV_VID_PIC(cmd->device, NULL);
+      vdenc_buf.DSFWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.DSFWDREF1.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.DSBWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
 
       vdenc_buf.OriginalUncompressedPicture.Address =
          anv_image_dpb_address(iv, enc_info->srcPictureResource.baseArrayLayer);
-      vdenc_buf.OriginalUncompressedPicture.PictureFields =
-         ANV_VID_PIC(cmd->device,
-                     vdenc_buf.OriginalUncompressedPicture.Address.bo);
+      vdenc_buf.OriginalUncompressedPicture.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.OriginalUncompressedPicture.Address.bo, 0),
+      };
 
-      vdenc_buf.StreamInDataPicture.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
+      vdenc_buf.StreamInDataPicture.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
 
       vdenc_buf.RowStoreScratchBuffer.Address = (struct anv_address) { NULL, 0x25080 };
-      vdenc_buf.RowStoreScratchBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL, .CacheSelect = 1);
+      vdenc_buf.RowStoreScratchBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+         .CacheSelect = 1,
+      };
 
       if (primary_ref_iv) {
          vdenc_buf.ColocatedMVReadBuffer.Address =
                anv_image_dmv_top_address(primary_ref_iv, primary_ref_layer);
       }
-      vdenc_buf.ColocatedMVReadBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, vdenc_buf.ColocatedMVReadBuffer.Address.bo);
-      vdenc_buf.FWDREF0.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.FWDREF1.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.FWDREF2.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.BWDREF0.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.VDEncStatisticsStreamOut.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.DSFWDREF04X.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.DSFWDREF14X.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.DSBWDREF04X.PictureFields = ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.VDEncLCUPAK_OBJ_CMDBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.ScaledReferenceSurface8X.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.ScaledReferenceSurface4X.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.VP9SegmentationMapStreamInBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.VP9SegmentationMapStreamOutBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.VDEncTileRowStoreBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.VDEncCumulativeCUCountStreamOutSurface.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.VDEncPaletteModeStreamOutSurface.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
+      vdenc_buf.ColocatedMVReadBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vdenc_buf.ColocatedMVReadBuffer.Address.bo, 0),
+      };
+      vdenc_buf.FWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.FWDREF1.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.FWDREF2.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+
+      vdenc_buf.BWDREF0.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VDEncStatisticsStreamOut.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.DSFWDREF04X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.DSFWDREF14X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.DSBWDREF04X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VDEncLCUPAK_OBJ_CMDBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.ScaledReferenceSurface8X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.ScaledReferenceSurface4X.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VP9SegmentationMapStreamInBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VP9SegmentationMapStreamOutBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VDEncTileRowStoreBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VDEncCumulativeCUCountStreamOutSurface.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.VDEncPaletteModeStreamOutSurface.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
 
       vdenc_buf.IntraPredictionRowStoreBuffer.Address =
          ANV_VID_MEM_ADDR(vid,
                           ANV_VID_MEM_AV1_INTRA_PREDICTION_LINE_ROWSTORE);
-      vdenc_buf.IntraPredictionRowStoreBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device,
-            vid->vid_mem[ANV_VID_MEM_AV1_INTRA_PREDICTION_LINE_ROWSTORE].mem->bo);
+      vdenc_buf.IntraPredictionRowStoreBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, vid->vid_mem[ANV_VID_MEM_AV1_INTRA_PREDICTION_LINE_ROWSTORE].mem->bo, 0),
+      };
 
-      vdenc_buf.ColocatedMVAVCWriteBuffer.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
-      vdenc_buf.Additional4XDSFWDREF.PictureFields =
-         ANV_VID_PIC(cmd->device, NULL);
+      vdenc_buf.ColocatedMVAVCWriteBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
+      vdenc_buf.Additional4XDSFWDREF.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
+         .MOCS = anv_mocs(cmd->device, NULL, 0),
+      };
    }
 
    /* Multi-tile scaffold (phase 1): the per-tile block runs once for now.
@@ -4398,22 +4859,19 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
    const StdVideoAV1TileInfo *ti = pic_info->pTileInfo;
    uint32_t num_tile_cols = ti ? ti->TileCols : 1;
    uint32_t num_tile_rows = ti ? ti->TileRows : 1;
-   const uint32_t sb_size = seq_hdr->flags.use_128x128_superblock ? 128 : 64;
-   const uint32_t pic_width_in_sb =
-      DIV_ROUND_UP(src_img->vk.extent.width, sb_size);
-   const uint32_t pic_height_in_sb =
-      DIV_ROUND_UP(src_img->vk.extent.height, sb_size);
    /* AV1 uniform tiling (5.9.15): the requested TileCols/TileRows may not
     * divide the frame evenly, so the actual tile count derived by the decoder
     * (tileWidthSb = ceil(sb / 2^log2); num = ceil(sb / tileWidthSb)) can be
     * smaller. Recompute it so we never emit a zero-width/height tail tile. */
    if (!ti || ti->flags.uniform_tile_spacing_flag) {
-      uint32_t cw = util_next_power_of_two(num_tile_cols);
-      uint32_t ch = util_next_power_of_two(num_tile_rows);
-      num_tile_cols = DIV_ROUND_UP(pic_width_in_sb,
-                                   DIV_ROUND_UP(pic_width_in_sb, cw));
-      num_tile_rows = DIV_ROUND_UP(pic_height_in_sb,
-                                   DIV_ROUND_UP(pic_height_in_sb, ch));
+      uint32_t sb_sz = seq_hdr->flags.use_128x128_superblock ? 128 : 64;
+      uint32_t pw_sb = DIV_ROUND_UP(src_img->vk.extent.width, sb_sz);
+      uint32_t ph_sb = DIV_ROUND_UP(src_img->vk.extent.height, sb_sz);
+      uint32_t cw = 1, ch = 1;
+      while (cw < num_tile_cols) cw <<= 1;
+      while (ch < num_tile_rows) ch <<= 1;
+      num_tile_cols = DIV_ROUND_UP(pw_sb, DIV_ROUND_UP(pw_sb, cw));
+      num_tile_rows = DIV_ROUND_UP(ph_sb, DIV_ROUND_UP(ph_sb, ch));
    }
 
    uint32_t num_tiles = num_tile_cols * num_tile_rows;
@@ -4423,6 +4881,10 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
    for (uint32_t tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
       anv_batch_emit(&cmd->batch, GENX(AVP_VD_CONTROL_STATE), v) {
          v.VDControlState.PipelineInitialization = true;
+#if GFX_VERx10 >= 125
+         v.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+            intel_needs_workaround(cmd->device->info, 16021867713);
+#endif
       }
 
       anv_batch_emit(&cmd->batch, GENX(MFX_WAIT), mfx) {
@@ -4547,21 +5009,19 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
                          buf.IntraBCDecodedOutputFrameBufferAddress.bo,
                          .TiledResourceMode = TRMODE_TILEF);
 
-         ANV_VID_CACHE_INIT(buf, BitstreamLineRowstoreBuffer, cmd->device,
-                            ANV_AV1_ROWSTORE_BTDL_OFFSET);
+         ANV_VID_CACHE_INIT(buf, BitstreamLineRowstoreBuffer, cmd->device, 0);
          ANV_VID_CACHE_INIT(buf, IntraPredictionLineRowstoreBuffer,
-                            cmd->device, ANV_AV1_ROWSTORE_IPDL_OFFSET);
+                            cmd->device, 0x6000);
 
          ANV_VID_CACHE_INIT(buf, SpatialMotionVectorLineBuffer, cmd->device,
-                            ANV_AV1_ROWSTORE_SMVL_OFFSET);
+                            0x2000);
          ANV_VID_CACHE_INIT(buf, DeblockerFilterLineYBuffer, cmd->device,
-                            ANV_AV1_ROWSTORE_DFLY_OFFSET);
+                            0xa000);
          ANV_VID_CACHE_INIT(buf, DeblockerFilterLineUBuffer, cmd->device,
-                            ANV_AV1_ROWSTORE_DFLU_OFFSET);
+                            0x15000);
          ANV_VID_CACHE_INIT(buf, DeblockerFilterLineVBuffer, cmd->device,
-                            ANV_AV1_ROWSTORE_DFLV_OFFSET);
-         ANV_VID_CACHE_INIT(buf, CDEFFilterLineBuffer, cmd->device,
-                            ANV_AV1_ROWSTORE_CDEF_OFFSET);
+                            0x18000);
+         ANV_VID_CACHE_INIT(buf, CDEFFilterLineBuffer, cmd->device, 0x1b000);
          ANV_VID_MEM_INIT(buf, BitstreamTileLineRowstoreBuffer, cmd->device,
                           vid, ANV_VID_MEM_AV1_BITSTREAM_TILE_LINE_ROWSTORE);
          ANV_VID_MEM_INIT(buf, IntraPredictionTileLineRowstoreBuffer,
@@ -4622,8 +5082,8 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
             buf.CDFTablesInitializationBufferAddress =
                anv_image_av1_table_address(primary_ref_iv, primary_ref_layer);
          } else {
-            uint32_t cdf_qindex = anv_video_encode_quantizer(vid, frame_info->constantQIndex,
-               pic_info->pQuantization ? pic_info->pQuantization->base_q_idx : 0);
+            uint32_t cdf_qindex = rc_disable ? frame_info->constantQIndex :
+               (pic_info->pQuantization ? pic_info->pQuantization->base_q_idx : 0);
             uint32_t cdf_index = cdf_qindex <= 20 ? 0 :
                                  cdf_qindex <= 60 ? 1 :
                                  cdf_qindex <= 120 ? 2 : 3;
@@ -4978,14 +5438,19 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
          /* TODO: super-res and loop-restoration unit size when those tools are enabled */
       }
 
+      uint32_t sb_size = seq_hdr->flags.use_128x128_superblock ? 128 : 64;
+      uint32_t pic_width_in_sb = DIV_ROUND_UP(frame_width, sb_size);
+      uint32_t pic_height_in_sb = DIV_ROUND_UP(frame_height, sb_size);
+
       uint32_t tile_col = tile_idx % num_tile_cols;
       uint32_t tile_row = tile_idx / num_tile_cols;
       uint32_t col_start_sb, row_start_sb, tile_w_sb, tile_h_sb;
       if (!ti || ti->flags.uniform_tile_spacing_flag) {
          /* Uniform spacing: pWidthInSbsMinus1/pHeightInSbsMinus1 may be NULL.
           * Tile size = ceil(pic_in_sb / next_pow2(tiles)) per AV1 5.9.15. */
-         uint32_t cols_pow2 = util_next_power_of_two(num_tile_cols);
-         uint32_t rows_pow2 = util_next_power_of_two(num_tile_rows);
+         uint32_t cols_pow2 = 1, rows_pow2 = 1;
+         while (cols_pow2 < num_tile_cols) cols_pow2 <<= 1;
+         while (rows_pow2 < num_tile_rows) rows_pow2 <<= 1;
          uint32_t tw = DIV_ROUND_UP(pic_width_in_sb, cols_pow2);
          uint32_t th = DIV_ROUND_UP(pic_height_in_sb, rows_pow2);
          col_start_sb = tile_col * tw;
@@ -5022,7 +5487,6 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
          til.NumberofActiveBEPipes = 1;
          til.NumofTileColumnsinFrameMinus1 = num_tile_cols - 1;
          til.NumofTileRowsinFrameMinus1 = num_tile_rows - 1;
-         til.DisableCDFUpdateFlag = pic_info->flags.disable_cdf_update;
          til.DisableFrameContextUpdateFlag =
             pic_info->flags.disable_frame_end_update_cdf ||
             (tile_idx != (ti ? ti->context_update_tile_id : 0));
@@ -5032,16 +5496,15 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
        * bitstream itself (anv_GetEncodedVideoSessionParametersKHR). The frame and
        * tile-group headers are inserted only on the first tile. */
       if (tile_idx == 0) {
-         uint32_t frame_hdr[128] = { 0 };
+         uint32_t frame_hdr[32] = { 0 };
          size_t hdr_size = 0;
          ASSERTED VkResult result =
             vk_video_encode_av1_frame_hdr(params, pic_info, base_q_idx,
                                           reference_select, false /* restoration_support */,
-                                          frame_info->generateObuExtensionHeader,
+                                          false /* generate_obu_extension */,
                                           frame_width, frame_height,
                                           sizeof(frame_hdr), &hdr_size, frame_hdr);
          assert(result == VK_SUCCESS);
-         assert(hdr_size <= sizeof(frame_hdr));
          uint32_t num_dw = DIV_ROUND_UP(hdr_size, 4);
          uint32_t last_bits = (hdr_size & 3) ? (hdr_size & 3) * 8 : 32;
          uint32_t *dw = anv_batch_emitn(&cmd->batch, num_dw + 2,
@@ -5170,17 +5633,18 @@ anv_av1_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *enc
       }
 
       anv_batch_emit(&cmd->batch, GENX(VDENC_HEVC_VP9_TILE_SLICE_STATE), til) {
+         uint32_t ctb_size = 64;
          bool tile_enable = true;
-         uint32_t tile_w_pix = MIN2(tile_w_sb * sb_size,
-                                    frame_width - col_start_sb * sb_size);
-         uint32_t tile_h_pix = MIN2(tile_h_sb * sb_size,
-                                    frame_height - row_start_sb * sb_size);
+         uint32_t tile_w_pix = MIN2(tile_w_sb * ctb_size,
+                                    frame_width - col_start_sb * ctb_size);
+         uint32_t tile_h_pix = MIN2(tile_h_sb * ctb_size,
+                                    frame_height - row_start_sb * ctb_size);
 
          til.NumParEngine = 0;
          til.TileNumber = tile_idx;
          til.TileRowStoreSelect = 0;
-         til.TileStartCTBX = col_start_sb * sb_size;
-         til.TileStartCTBY = row_start_sb * sb_size;
+         til.TileStartCTBX = col_start_sb * ctb_size;
+         til.TileStartCTBY = row_start_sb * ctb_size;
          til.TileWidth = tile_w_pix - 1;
          til.TileHeight = tile_h_pix - 1;
          til.StreaminOffsetEnable = tile_enable;
@@ -5458,21 +5922,87 @@ emit_query_mi_availability(struct mi_builder *b,
    mi_store(b, mi_mem64(addr), mi_imm(available));
 }
 
-
 #if GFX_VER < 11
 #define MFC_BITSTREAM_BYTECOUNT_FRAME_REG       0x128A0
 #define HCP_BITSTREAM_BYTECOUNT_FRAME_REG       0x1E9A0
-#elif GFX_VER >= 11
-#define MFC_BITSTREAM_BYTECOUNT_FRAME_REG       0x1C08A0
-#define HCP_BITSTREAM_BYTECOUNT_FRAME_REG       0x1C28A0
+#else
+/* Offsets within the VDBOX MMIO block, see the CS MMIO note below. */
+#define MFC_BITSTREAM_BYTECOUNT_FRAME_REG       0x08A0
+#define HCP_BITSTREAM_BYTECOUNT_FRAME_REG       0x28A0
 #endif
+
+/* Writes the VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR value of
+ * the encode operation that was just emitted at query_addr + 8 and marks the
+ * query available.
+ */
+void
+genX(cmd_buffer_emit_video_encode_feedback)(struct anv_cmd_buffer *cmd_buffer,
+                                            struct anv_query_pool *pool,
+                                            struct anv_address query_addr)
+{
+   struct mi_builder b;
+   mi_builder_init(&b, cmd_buffer->device->info, &cmd_buffer->batch);
+   const uint32_t mocs = anv_mocs_for_address(cmd_buffer->device, &query_addr);
+   mi_builder_set_mocs(&b, mocs);
+
+   struct anv_address bytes_addr = anv_address_add(query_addr, 8);
+
+   /* VK_KHR_video_encode_feedback2 statistics of the encode that was just
+    * recorded, packed into the extra query slots.
+    */
+   mi_store(&b, mi_mem32(anv_address_add(query_addr, 16)),
+            mi_imm((uint32_t)cmd_buffer->video.feedback_avg_qp));
+   mi_store(&b, mi_mem32(anv_address_add(query_addr, 20)),
+            mi_imm((uint32_t)cmd_buffer->video.feedback_min_qp));
+   mi_store(&b, mi_mem32(anv_address_add(query_addr, 24)),
+            mi_imm((uint32_t)cmd_buffer->video.feedback_max_qp));
+   mi_store(&b, mi_mem32(anv_address_add(query_addr, 28)),
+            mi_imm(cmd_buffer->video.feedback_intra_pixels));
+   mi_store(&b, mi_mem32(anv_address_add(query_addr, 32)),
+            mi_imm(cmd_buffer->video.feedback_inter_pixels));
+   mi_store(&b, mi_mem32(anv_address_add(query_addr, 36)),
+            mi_imm(cmd_buffer->video.feedback_skipped_pixels));
+   mi_store(&b, mi_mem32(anv_address_add(query_addr, 40)),
+            mi_imm(cmd_buffer->video.feedback_picture_partition_count));
+
+   if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR) {
+      /* AV1 BITSTREAM_BYTECOUNT_TILE is per-tile; the frame total (all tiles)
+       * is the running sum accumulated into the encode scratch dword. */
+      struct anv_video_session *vid = cmd_buffer->video.vid;
+      struct anv_address tile_bs_accum =
+         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_AV1_ENCODE_TILE_BITSTREAM_ACCUM);
+      mi_store(&b, mi_mem64(bytes_addr), mi_mem32(tile_bs_accum));
+   } else {
+      uint32_t reg;
+      if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR)
+         reg = MFC_BITSTREAM_BYTECOUNT_FRAME_REG;
+      else if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR)
+         reg = HCP_BITSTREAM_BYTECOUNT_FRAME_REG;
+      else
+         UNREACHABLE("Invalid codec operation");
+
+      /* Every VDBOX has its own copy of the MFC/HCP registers in its MMIO
+       * block (0x1C0000 for VCS0, 0x1C4000 for VCS1, ...) and the kernel is
+       * free to run a video queue on any instance, so address the register
+       * relative to the CS MMIO base of the engine executing the batch.
+       */
+      anv_batch_emit(&cmd_buffer->batch, GENX(MI_STORE_REGISTER_MEM), srm) {
+         srm.RegisterAddress = reg;
+#if GFX_VER >= 11
+         srm.AddCSMMIOStartOffset = true;
+#endif
+         srm.MemoryAddress = bytes_addr;
+      }
+      mi_store(&b, mi_mem32(anv_address_add(bytes_addr, 4)), mi_imm(0));
+   }
+
+   emit_query_mi_availability(&b, query_addr, true);
+}
 
 static void
 handle_inline_query_end(struct anv_cmd_buffer *cmd_buffer,
                         const VkVideoInlineQueryInfoKHR *inline_query)
 {
-   uint32_t reg_addr;
-   struct mi_builder b;
    ANV_FROM_HANDLE(anv_query_pool, pool, inline_query->queryPool);
    if (pool == VK_NULL_HANDLE)
       return;
@@ -5481,29 +6011,7 @@ handle_inline_query_end(struct anv_cmd_buffer *cmd_buffer,
       .offset = inline_query->firstQuery * pool->stride,
    };
 
-   mi_builder_init(&b, cmd_buffer->device->info, &cmd_buffer->batch);
-   const uint32_t mocs = anv_mocs_for_address(cmd_buffer->device, &query_addr);
-   mi_builder_set_mocs(&b, mocs);
-
-   if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
-      reg_addr = MFC_BITSTREAM_BYTECOUNT_FRAME_REG;
-   } else if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
-      reg_addr = HCP_BITSTREAM_BYTECOUNT_FRAME_REG;
-   } else if (pool->codec & VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR) {
-      /* AV1 BITSTREAM_BYTECOUNT_TILE is per-tile; the frame total (all tiles)
-       * is the running sum accumulated into the encode scratch dword. */
-      struct anv_video_session *vid = cmd_buffer->video.vid;
-      struct anv_address tile_bs_accum =
-         ANV_VID_MEM_ADDR(vid, ANV_VID_MEM_AV1_ENCODE_TILE_BITSTREAM_ACCUM);
-      mi_store(&b, mi_mem64(anv_address_add(query_addr, 8)), mi_mem32(tile_bs_accum));
-      emit_query_mi_availability(&b, query_addr, true);
-      return;
-   } else {
-      UNREACHABLE("Invalid codec operation");
-   }
-
-   mi_store(&b, mi_mem64(anv_address_add(query_addr, 8)), mi_reg32(reg_addr));
-   emit_query_mi_availability(&b, query_addr, true);
+   genX(cmd_buffer_emit_video_encode_feedback)(cmd_buffer, pool, query_addr);
 }
 
 void
@@ -5515,11 +6023,89 @@ genX(CmdEncodeVideoKHR)(VkCommandBuffer commandBuffer,
    const VkVideoInlineQueryInfoKHR *inline_query =
       vk_find_struct_const(pEncodeInfo->pNext, VIDEO_INLINE_QUERY_INFO_KHR);
 
+   /* VK_KHR_video_encode_feedback2: record whole frame statistics for the
+    * inline query feedback.  Rate control disabled reports the constant QP the
+    * app asked for, otherwise the initial QP of the picture parameter set.
+    */
+   {
+      const uint32_t width = pEncodeInfo->srcPictureResource.codedExtent.width;
+      const uint32_t height = pEncodeInfo->srcPictureResource.codedExtent.height;
+      const uint32_t total_pixels = width * height;
+      int32_t qp = 26;
+      uint32_t partitions = 1;
+
+      if (cmd_buffer->video.vid->vk.op ==
+          VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
+         const VkVideoEncodeH265PictureInfoKHR *frame_info =
+            vk_find_struct_const(pEncodeInfo->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
+         if (frame_info != NULL) {
+            partitions = frame_info->naluSliceSegmentEntryCount;
+            const StdVideoH265PictureParameterSet *pps =
+               vk_video_find_h265_enc_std_pps(cmd_buffer->video.params,
+                  frame_info->pStdPictureInfo->pps_pic_parameter_set_id);
+            if (pps != NULL)
+               qp = pps->init_qp_minus26 + 26;
+            if (cmd_buffer->video.vid->rc_mode ==
+                VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR &&
+                frame_info->naluSliceSegmentEntryCount > 0)
+               qp = frame_info->pNaluSliceSegmentEntries[0].constantQp;
+         }
+      } else if (cmd_buffer->video.vid->vk.op ==
+                 VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
+         const VkVideoEncodeH264PictureInfoKHR *frame_info =
+            vk_find_struct_const(pEncodeInfo->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
+         if (frame_info != NULL) {
+            partitions = frame_info->naluSliceEntryCount;
+            const StdVideoH264PictureParameterSet *pps =
+               vk_video_find_h264_enc_std_pps(cmd_buffer->video.params,
+                  frame_info->pStdPictureInfo->pic_parameter_set_id);
+            if (pps != NULL)
+               qp = pps->pic_init_qp_minus26 + 26;
+            if (cmd_buffer->video.vid->rc_mode ==
+                VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR &&
+                frame_info->naluSliceEntryCount > 0)
+               qp = frame_info->pNaluSliceEntries[0].constantQp;
+         }
+      }
+
+      bool is_intra_frame = false;
+      if (cmd_buffer->video.vid->vk.op ==
+          VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
+         const VkVideoEncodeH265PictureInfoKHR *frame_info =
+            vk_find_struct_const(pEncodeInfo->pNext, VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
+         if (frame_info != NULL)
+            is_intra_frame = frame_info->pStdPictureInfo->pic_type ==
+                             STD_VIDEO_H265_PICTURE_TYPE_IDR ||
+                             frame_info->pStdPictureInfo->pic_type ==
+                             STD_VIDEO_H265_PICTURE_TYPE_I;
+      } else if (cmd_buffer->video.vid->vk.op ==
+                 VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
+         const VkVideoEncodeH264PictureInfoKHR *frame_info =
+            vk_find_struct_const(pEncodeInfo->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
+         if (frame_info != NULL)
+            is_intra_frame = frame_info->pStdPictureInfo->primary_pic_type ==
+                             STD_VIDEO_H264_PICTURE_TYPE_IDR ||
+                             frame_info->pStdPictureInfo->primary_pic_type ==
+                             STD_VIDEO_H264_PICTURE_TYPE_I;
+      }
+
+      cmd_buffer->video.feedback_avg_qp = qp;
+      cmd_buffer->video.feedback_min_qp = qp;
+      cmd_buffer->video.feedback_max_qp = qp;
+      cmd_buffer->video.feedback_picture_partition_count = partitions;
+      cmd_buffer->video.feedback_intra_pixels = is_intra_frame ? total_pixels : 0;
+      cmd_buffer->video.feedback_inter_pixels = is_intra_frame ? 0 : total_pixels;
+      cmd_buffer->video.feedback_skipped_pixels = 0;
+   }
+
    switch (cmd_buffer->video.vid->vk.op) {
    case VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR:
       anv_h264_encode_video(cmd_buffer, pEncodeInfo);
       break;
    case VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR:
+      /* Rotate the line / metadata buffer set per in-flight frame. */
+      cmd_buffer->video.vid->h265_slot =
+         cmd_buffer->video.vid->h265_frame_count++ % ANV_VIDEO_H265_FRAME_SLOTS;
       anv_h265_encode_video(cmd_buffer, pEncodeInfo);
       break;
    case VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR:

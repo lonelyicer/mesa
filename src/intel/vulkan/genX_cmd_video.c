@@ -87,6 +87,14 @@ genX(CmdControlVideoCodingKHR)(VkCommandBuffer commandBuffer,
          const VkVideoEncodeRateControlLayerInfoKHR *layer = &rate_control_info->pLayers[0];
 
          rc->average_bitrate = layer->averageBitrate;
+         if (getenv("ANV_BRC_DEBUG_RC"))
+            fprintf(stderr, "RC: mode=%d avg=%llu max=%llu fps=%llu/%llu vbv=%llu\n",
+                    (int)rate_control_info->rateControlMode,
+                    (unsigned long long)layer->averageBitrate,
+                    (unsigned long long)layer->maxBitrate,
+                    (unsigned long long)layer->frameRateNumerator,
+                    (unsigned long long)layer->frameRateDenominator,
+                    (unsigned long long)rate_control_info->virtualBufferSizeInMs);
          rc->max_bitrate = layer->maxBitrate;
          rc->frame_rate_num = layer->frameRateNumerator;
          rc->frame_rate_den = layer->frameRateDenominator;
@@ -318,7 +326,11 @@ anv_h265_decode_video(struct anv_cmd_buffer *cmd_buffer,
    }
 
    anv_batch_emit(&cmd_buffer->batch, GENX(VD_CONTROL_STATE), cs) {
-      cs.PipelineInitialization = true;
+      cs.VDControlState.PipelineInitialization = true;
+#if GFX_VERx10 >= 125
+      cs.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd_buffer->device->info, 16021867713);
+#endif
    }
 
    anv_batch_emit(&cmd_buffer->batch, GENX(MFX_WAIT), mfx) {
@@ -719,7 +731,11 @@ anv_h265_decode_video(struct anv_cmd_buffer *cmd_buffer,
 
 #if GFX_VER >= 12
    anv_batch_emit(&cmd_buffer->batch, GENX(VD_CONTROL_STATE), cs) {
-      cs.MemoryImplicitFlush = true;
+      cs.VDControlState.MemoryImplicitFlush = true;
+#if GFX_VERx10 >= 125
+      cs.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd_buffer->device->info, 16021867713);
+#endif
    }
 #endif
 
@@ -1204,6 +1220,10 @@ anv_av1_decode_dummy(struct anv_cmd_buffer *cmd_buffer)
 
    anv_batch_emit(&cmd_buffer->batch, GENX(AVP_VD_CONTROL_STATE), vd) {
       vd.VDControlState.PipelineInitialization = 1;
+#if GFX_VERx10 >= 125
+      vd.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd_buffer->device->info, 16021867713);
+#endif
    }
 
    anv_batch_emit(&cmd_buffer->batch, GENX(MFX_WAIT), mfx) {
@@ -1499,6 +1519,10 @@ anv_av1_decode_dummy(struct anv_cmd_buffer *cmd_buffer)
 
    anv_batch_emit(&cmd_buffer->batch, GENX(AVP_VD_CONTROL_STATE), vd) {
       vd.VDControlState.MemoryImplicitFlush = 1;
+#if GFX_VERx10 >= 125
+      vd.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd_buffer->device->info, 16021867713);
+#endif
    };
 
    anv_batch_emit(&cmd_buffer->batch, GENX(VD_PIPELINE_FLUSH), vd) {
@@ -1549,6 +1573,10 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
 
    anv_batch_emit(&cmd_buffer->batch, GENX(AVP_VD_CONTROL_STATE), vd) {
       vd.VDControlState.PipelineInitialization = 1;
+#if GFX_VERx10 >= 125
+      vd.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd_buffer->device->info, 16021867713);
+#endif
    }
 
    anv_batch_emit(&cmd_buffer->batch, GENX(MFX_WAIT), mfx) {
@@ -2530,6 +2558,10 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
    if (last_tile) {
       anv_batch_emit(&cmd_buffer->batch, GENX(AVP_VD_CONTROL_STATE), vd) {
          vd.VDControlState.MemoryImplicitFlush = 1;
+#if GFX_VERx10 >= 125
+         vd.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+            intel_needs_workaround(cmd_buffer->device->info, 16021867713);
+#endif
       }
 
       anv_batch_emit(&cmd_buffer->batch, GENX(VD_PIPELINE_FLUSH), vd) {
@@ -3088,7 +3120,11 @@ anv_vp9_decode_video(struct anv_cmd_buffer *cmd_buffer,
    }
 
    anv_batch_emit(&cmd_buffer->batch, GENX(VD_CONTROL_STATE), cs) {
-      cs.PipelineInitialization = true;
+      cs.VDControlState.PipelineInitialization = true;
+#if GFX_VERx10 >= 125
+      cs.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd_buffer->device->info, 16021867713);
+#endif
    }
 
    anv_batch_emit(&cmd_buffer->batch, GENX(MFX_WAIT), mfx) {
@@ -3541,7 +3577,11 @@ anv_vp9_decode_video(struct anv_cmd_buffer *cmd_buffer,
 
 #if GFX_VER >= 12
    anv_batch_emit(&cmd_buffer->batch, GENX(VD_CONTROL_STATE), cs) {
-      cs.MemoryImplicitFlush = true;
+      cs.VDControlState.MemoryImplicitFlush = true;
+#if GFX_VERx10 >= 125
+      cs.VDControlState.VDboxPipelineArchitectureClockgateDisable =
+         intel_needs_workaround(cmd_buffer->device->info, 16021867713);
+#endif
    }
 #endif
 

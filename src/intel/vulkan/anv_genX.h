@@ -559,6 +559,10 @@ uint32_t genX(shader_cmd_size)(struct anv_device *device,
 
 void genX(batch_emit_post_dispatch_wa)(struct anv_batch *batch);
 
+void genX(cmd_buffer_emit_video_encode_feedback)(struct anv_cmd_buffer *cmd_buffer,
+                                                 struct anv_query_pool *pool,
+                                                 struct anv_address query_addr);
+
 static inline void
 genX(cmd_buffer_post_dispatch_wa)(struct anv_cmd_buffer *cmd_buffer)
 {
