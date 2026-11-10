@@ -613,7 +613,10 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
           anv_video_encode_brc_supported(pdevice)) {
          enc_caps->rateControlModes |= VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR |
                                        VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR;
-         enc_caps->maxBitrate = 160000000;
+         /* Steam Link style streaming asks for up to 200 Mbps; the BRC
+          * accepts any target below this ceiling.
+          */
+         enc_caps->maxBitrate = 500000000;
       }
       enc_caps->maxRateControlLayers = 1;
       enc_caps->maxQualityLevels = 1;
@@ -643,7 +646,10 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
          ext->flags = VK_VIDEO_ENCODE_H264_CAPABILITY_HRD_COMPLIANCE_BIT_KHR |
                       VK_VIDEO_ENCODE_H264_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR;
          ext->maxLevelIdc = STD_VIDEO_H264_LEVEL_IDC_5_1;
-         ext->maxSliceCount = 1;
+         /* Multi-slice pictures: VDEnc splits the frame into row
+          * partitions, one slice header per partition.
+          */
+         ext->maxSliceCount = 4;
          ext->maxPPictureL0ReferenceCount = 3;
          ext->maxBPictureL0ReferenceCount = 3;
          ext->maxL1ReferenceCount = 1;
