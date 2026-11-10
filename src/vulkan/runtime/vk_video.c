@@ -2157,6 +2157,56 @@ vk_video_encode_h265_pps(const StdVideoH265PictureParameterSet *pps,
    *data_size_ptr += vl_bitstream_get_byte_count(&enc);
 }
 
+static void
+encode_h264_ref_list_modifications(struct vl_bitstream_encoder *enc,
+                                   uint32_t count,
+                                   const StdVideoEncodeH264RefListModEntry *entries)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      const StdVideoEncodeH264RefListModEntry *entry = &entries[i];
+      vl_bitstream_exp_golomb_ue(enc, entry->modification_of_pic_nums_idc);
+      switch (entry->modification_of_pic_nums_idc) {
+      case STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_SHORT_TERM_SUBTRACT:
+      case STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_SHORT_TERM_ADD:
+         vl_bitstream_exp_golomb_ue(enc, entry->abs_diff_pic_num_minus1);
+         break;
+      case STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_LONG_TERM:
+         vl_bitstream_exp_golomb_ue(enc, entry->long_term_pic_num);
+         break;
+      case STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_END:
+         return;
+      default:
+         UNREACHABLE("invalid H.264 reference list modification");
+      }
+   }
+   vl_bitstream_exp_golomb_ue(enc, STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_END);
+}
+
+static void
+encode_h264_ref_pic_marking(struct vl_bitstream_encoder *enc,
+                            const StdVideoEncodeH264ReferenceListsInfo *ref_lists)
+{
+   for (uint32_t i = 0; i < ref_lists->refPicMarkingOpCount; i++) {
+      const StdVideoEncodeH264RefPicMarkingEntry *entry =
+         &ref_lists->pRefPicMarkingOperations[i];
+      const StdVideoH264MemMgmtControlOp op = entry->memory_management_control_operation;
+      vl_bitstream_exp_golomb_ue(enc, op);
+      if (op == STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_END)
+         return;
+      if (op == STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_UNMARK_SHORT_TERM ||
+          op == STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_MARK_LONG_TERM)
+         vl_bitstream_exp_golomb_ue(enc, entry->difference_of_pic_nums_minus1);
+      if (op == STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_UNMARK_LONG_TERM)
+         vl_bitstream_exp_golomb_ue(enc, entry->long_term_pic_num);
+      if (op == STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_MARK_LONG_TERM ||
+          op == STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_MARK_CURRENT_AS_LONG_TERM)
+         vl_bitstream_exp_golomb_ue(enc, entry->long_term_frame_idx);
+      if (op == STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_SET_MAX_LONG_TERM_INDEX)
+         vl_bitstream_exp_golomb_ue(enc, entry->max_long_term_frame_idx_plus1);
+   }
+   vl_bitstream_exp_golomb_ue(enc, STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_END);
+}
+
 void
 vk_video_encode_h264_slice_header(const StdVideoEncodeH264PictureInfo *pic_info,
                                   const StdVideoH264SequenceParameterSet *sps,
@@ -2242,10 +2292,9 @@ vk_video_encode_h264_slice_header(const StdVideoEncodeH264PictureInfo *pic_info,
       vl_bitstream_put_bits(&enc, 1, pic_info->pRefLists->flags.ref_pic_list_modification_flag_l0);
 
       if (pic_info->pRefLists->flags.ref_pic_list_modification_flag_l0) {
-         assert(0);
-         /* TODO */
-         for (unsigned i = 0; i < pic_info->pRefLists->refList0ModOpCount; i++) {
-         }
+         encode_h264_ref_list_modifications(&enc,
+            pic_info->pRefLists->refList0ModOpCount,
+            pic_info->pRefLists->pRefList0ModOperations);
       }
    } else if (slice_type == STD_VIDEO_H264_SLICE_TYPE_B) {
       vl_bitstream_put_bits(&enc, 1, slice_header->flags.direct_spatial_mv_pred_flag);
@@ -2258,16 +2307,16 @@ vk_video_encode_h264_slice_header(const StdVideoEncodeH264PictureInfo *pic_info,
 
       vl_bitstream_put_bits(&enc, 1, pic_info->pRefLists->flags.ref_pic_list_modification_flag_l0);
       if (pic_info->pRefLists->flags.ref_pic_list_modification_flag_l0) {
-         assert(0);
-         for (unsigned i = 0; i < pic_info->pRefLists->refList0ModOpCount; i++) {
-         }
+         encode_h264_ref_list_modifications(&enc,
+            pic_info->pRefLists->refList0ModOpCount,
+            pic_info->pRefLists->pRefList0ModOperations);
       }
 
       vl_bitstream_put_bits(&enc, 1, pic_info->pRefLists->flags.ref_pic_list_modification_flag_l1);
       if (pic_info->pRefLists->flags.ref_pic_list_modification_flag_l1) {
-         assert(0);
-         for (unsigned i = 0; i < pic_info->pRefLists->refList1ModOpCount; i++) {
-         }
+         encode_h264_ref_list_modifications(&enc,
+            pic_info->pRefLists->refList1ModOpCount,
+            pic_info->pRefLists->pRefList1ModOperations);
       }
    }
 
@@ -2280,15 +2329,13 @@ vk_video_encode_h264_slice_header(const StdVideoEncodeH264PictureInfo *pic_info,
    /* dec_ref_pic_marking */
    /* nal_ref_idc != 0 */
    if (slice_type != STD_VIDEO_H264_SLICE_TYPE_B || pic_info->flags.is_reference) {
-      unsigned char no_output_of_prior_pics_flag = 0;
-      unsigned char long_term_reference_flag = 0;
-      unsigned char adaptive_ref_pic_marking_mode_flag = 0;
-
       if (pic_info->flags.IdrPicFlag) {
-         vl_bitstream_put_bits(&enc, 1, no_output_of_prior_pics_flag);
-         vl_bitstream_put_bits(&enc, 1, long_term_reference_flag);
+         vl_bitstream_put_bits(&enc, 1, pic_info->flags.no_output_of_prior_pics_flag);
+         vl_bitstream_put_bits(&enc, 1, pic_info->flags.long_term_reference_flag);
       } else {
-         vl_bitstream_put_bits(&enc, 1, adaptive_ref_pic_marking_mode_flag);
+         vl_bitstream_put_bits(&enc, 1, pic_info->flags.adaptive_ref_pic_marking_mode_flag);
+         if (pic_info->flags.adaptive_ref_pic_marking_mode_flag)
+            encode_h264_ref_pic_marking(&enc, pic_info->pRefLists);
       }
    }
 

@@ -1310,6 +1310,11 @@ anv_h264_encode_video(struct anv_cmd_buffer *cmd, const VkVideoEncodeInfoKHR *en
       vdenc_buf.IntraPredictionRowStoreBuffer.PictureFields = (struct GENX(VDENC_SURFACE_CONTROL_BITS)) {
          .MOCS = anv_mocs(cmd->device, NULL, 0),
       };
+      /* CollocMVWREn in VDENC_AVC_IMG_STATE needs a matching write target.
+       * B pictures later read these records from L1[0], including for
+       * spatial direct prediction. Keep them with the reconstructed DPB
+       * image so each in-flight reference has its own MV data.
+       */
       if (enc_info->pSetupReferenceSlot != NULL &&
           (frame_info->pStdPictureInfo->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_P ||
            frame_info->pStdPictureInfo->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_B))
