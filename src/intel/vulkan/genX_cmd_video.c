@@ -71,8 +71,9 @@ genX(CmdControlVideoCodingKHR)(VkCommandBuffer commandBuffer,
          flush.VideoPipelineCacheInvalidate = 1;
       }
 
-      if (pCodingControlInfo->flags &  VK_VIDEO_CODING_CONTROL_ENCODE_RATE_CONTROL_BIT_KHR)
-         cmd_buffer->video.vid->rc.frame_counter = 0;
+      struct anv_video_session *vid = cmd_buffer->video.vid;
+      vid->rc_mode = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR;
+      memset(&vid->rc, 0, sizeof(vid->rc));
    }
 
    if (pCodingControlInfo->flags &  VK_VIDEO_CODING_CONTROL_ENCODE_RATE_CONTROL_BIT_KHR) {
@@ -80,6 +81,8 @@ genX(CmdControlVideoCodingKHR)(VkCommandBuffer commandBuffer,
          vk_find_struct_const(pCodingControlInfo->pNext, VIDEO_ENCODE_RATE_CONTROL_INFO_KHR);
       struct anv_video_session *vid = cmd_buffer->video.vid;
       struct anv_video_rc_state *rc = &vid->rc;
+      const struct anv_video_rc_state old_rc = *rc;
+      const VkVideoEncodeRateControlModeFlagBitsKHR old_mode = vid->rc_mode;
 
       vid->rc_mode = rate_control_info->rateControlMode;
 
@@ -110,6 +113,8 @@ genX(CmdControlVideoCodingKHR)(VkCommandBuffer commandBuffer,
             vk_find_struct_const(layer->pNext, VIDEO_ENCODE_H265_RATE_CONTROL_LAYER_INFO_KHR);
          const VkVideoEncodeH264RateControlLayerInfoKHR *h264_layer =
             vk_find_struct_const(layer->pNext, VIDEO_ENCODE_H264_RATE_CONTROL_LAYER_INFO_KHR);
+         rc->min_qp = 0;
+         rc->max_qp = 0;
          if (h265_layer) {
             if (h265_layer->useMinQp)
                rc->min_qp = MIN3(h265_layer->minQp.qpI, h265_layer->minQp.qpP, h265_layer->minQp.qpB);
@@ -138,6 +143,25 @@ genX(CmdControlVideoCodingKHR)(VkCommandBuffer commandBuffer,
          rc->consecutive_b_frames = h264_rc->consecutiveBFrameCount;
          rc->rc_flags = h264_rc->flags;
       }
+
+      /* HuC consumes the rate-control configuration during BRC init. A
+       * RATE_CONTROL update need not include RESET, so restart BRC when
+       * its inputs change, even in the middle of a GOP.
+       */
+      if (vid->rc_mode != old_mode ||
+          rc->average_bitrate != old_rc.average_bitrate ||
+          rc->max_bitrate != old_rc.max_bitrate ||
+          rc->frame_rate_num != old_rc.frame_rate_num ||
+          rc->frame_rate_den != old_rc.frame_rate_den ||
+          rc->vbv_size_bits != old_rc.vbv_size_bits ||
+          rc->vbv_initial_fullness_bits != old_rc.vbv_initial_fullness_bits ||
+          rc->min_qp != old_rc.min_qp ||
+          rc->max_qp != old_rc.max_qp ||
+          rc->gop_frame_count != old_rc.gop_frame_count ||
+          rc->idr_period != old_rc.idr_period ||
+          rc->consecutive_b_frames != old_rc.consecutive_b_frames ||
+          rc->rc_flags != old_rc.rc_flags)
+         rc->frame_counter = 0;
    }
 }
 

@@ -903,7 +903,7 @@ anv_h264_brc_emit_huc_update(struct anv_cmd_buffer *cmd,
        */
       regions[7] = anv_brc_mem_addr(vid, ANV_VID_MEM_BRC_PAK_STATS);
       regions[5] = anv_cmd_buffer_temporary_state_address(cmd, cd_state);
-      regions[6] = anv_brc_mem_addr(vid, ANV_VID_MEM_BRC_EXEC_SLB);
+      regions[6] = anv_brc_exec_slb_addr(vid);
       regions[15] = anv_brc_mem_addr(vid, ANV_VID_MEM_BRC_DEBUG);
 
       for (uint32_t i = 0; i < 16; i++) {
@@ -932,29 +932,20 @@ anv_h264_brc_emit_huc_update(struct anv_cmd_buffer *cmd,
 #define ANV_HUC_HEVC_BRC_FLAG_VBR                 2
 
 #if GFX_VERx10 >= 125
-#if GFX_VERx10 >= 200
-/* Xe2 HPG: VDENC_CMD1 grows to 39 dwords (vs 33 on Gen12.5), so the
- * HCP_PIC_STATE and VDENC_CMD2 offsets in the BRC SLB move.
- */
 #define ANV_H265_BRC_SLB_GROUP1_SIZE      64
-#define ANV_H265_BRC_SLB_PIC_STATE_OFFSET 220
-#define ANV_H265_BRC_SLB_CMD2_OFFSET      384
-/* The reference SLB places HCP_SLICE_STATE at 0x280 (640) on this
- * hardware, right after VDENC_CMD2 and one MI_BATCH_BUFFER_END.
- */
 #define ANV_H265_BRC_SLB_GROUP3_OFFSET    640
-#else
-#define ANV_H265_BRC_SLB_GROUP1_SIZE      64
-#define ANV_H265_BRC_SLB_PIC_STATE_OFFSET 196
-#define ANV_H265_BRC_SLB_CMD2_OFFSET      360
-#define ANV_H265_BRC_SLB_GROUP3_OFFSET    640
-#endif
 #else
 #define ANV_H265_BRC_SLB_GROUP1_SIZE      40
-#define ANV_H265_BRC_SLB_PIC_STATE_OFFSET 164
-#define ANV_H265_BRC_SLB_CMD2_OFFSET      328
 #define ANV_H265_BRC_SLB_GROUP3_OFFSET    536
 #endif
+
+/* Group 2 is VDENC_CMD1, HCP_PIC_STATE and VDENC_CMD2 back to back.
+ * Derive their offsets from the generation-specific command lengths.
+ */
+#define ANV_H265_BRC_SLB_PIC_STATE_OFFSET \
+   (ANV_H265_BRC_SLB_GROUP1_SIZE + GENX(VDENC_CMD1_length) * 4)
+#define ANV_H265_BRC_SLB_CMD2_OFFSET \
+   (ANV_H265_BRC_SLB_PIC_STATE_OFFSET + GENX(HCP_PIC_STATE_length) * 4)
 
 #define ANV_H265_HCP_BITSTREAM_BYTECOUNT_FRAME_OFFSET          0x28a0
 #define ANV_H265_HCP_BITSTREAM_BYTECOUNT_FRAME_NOHEADER_OFFSET 0x28a4
@@ -1390,8 +1381,8 @@ anv_h265_brc_fill_init_dmem(struct anv_cmd_buffer *cmd,
    dmem->FrameRateM_U32 = frame_rate_m;
    dmem->FrameRateD_U32 = frame_rate_d;
    dmem->BRCFlag = is_cbr ? ANV_HUC_HEVC_BRC_FLAG_CBR : ANV_HUC_HEVC_BRC_FLAG_VBR;
-   /* media-driver enables per-CU QP control (MB BRC internal). */
-   dmem->CuQpCtrl_U8 = 3;
+   /* This path uses frame-level BRC, without a CU QP stream-in map. */
+   dmem->CuQpCtrl_U8 = 0;
 
    uint32_t intra_period = MIN2(gop, 4001) - 1;
    intra_period = DIV_ROUND_UP(intra_period, gop_ref_dist) * gop_ref_dist;
@@ -1481,6 +1472,18 @@ anv_h265_brc_fill_init_dmem(struct anv_cmd_buffer *cmd,
    dmem->LongTermRefMsdk_U8 = 1;
 }
 
+static uint32_t
+anv_h265_brc_num_passes(const struct anv_video_session *vid)
+{
+   switch (vid->vk.enc_usage.tuning_mode) {
+   case VK_VIDEO_ENCODE_TUNING_MODE_LOW_LATENCY_KHR:
+   case VK_VIDEO_ENCODE_TUNING_MODE_ULTRA_LOW_LATENCY_KHR:
+      return 1;
+   default:
+      return 2;
+   }
+}
+
 static void
 anv_h265_brc_fill_update_dmem(struct anv_cmd_buffer *cmd,
                               const VkVideoEncodeInfoKHR *enc_info,
@@ -1521,8 +1524,7 @@ anv_h265_brc_fill_update_dmem(struct anv_cmd_buffer *cmd,
 
    /* TODO: derive from the level */
    dmem->MaxNumSliceAllowed_U16 = ANV_HUC_HEVC_BRC_MAX_NUM_SLICES;
-   /* media-driver sets 0x4 (tile-based BRC, frame level) for HEVC. */
-   dmem->OpMode_U8 = 0x4;
+   dmem->OpMode_U8 = 1; /* Frame-based BRC. */
    dmem->CurrentFrameType_U8 = pic_type == 0 ? 2 : (is_low_delay ? 0 : 1);
    if (getenv("ANV_BRC_DEBUG_REFS") && ref_lists) {
       fprintf(stderr,
@@ -1632,7 +1634,7 @@ anv_h265_brc_fill_update_dmem(struct anv_cmd_buffer *cmd,
          }
       }
    }
-   dmem->MaxNumPass_U8 = 2;
+   dmem->MaxNumPass_U8 = anv_h265_brc_num_passes(vid);
    dmem->SceneChgPrevIntraPctThreshold_U8 = 96;
    dmem->SceneChgCurIntraPctThreshold_U8 = 192;
    dmem->IPAverageCoeff_U8 = 64;
@@ -1665,22 +1667,11 @@ anv_h265_brc_fill_update_dmem(struct anv_cmd_buffer *cmd,
     */
    dmem->SceneChgPrevIntraPctThreshold_U8 = 96;
    dmem->SceneChgCurIntraPctThreshold_U8 = 192;
-   /* Per-frame target for CBR, in bytes.  The kernel compares it against the
-    * encoded frame size, so feeding it bits makes the rate control aim about
-    * eight times too high (measured: 4 Mbps target produced 7.2 Mbps); VBR has
-    * no fixed per-frame target and leaves the field at 0 (auto).
+   /* TargetFrameSize is a lookahead/target-frame-size control in bits, not
+    * the average byte budget. Ordinary CBR/VBR uses the bitrate and VBV
+    * parameters from BRC init and leaves this override disabled.
     */
-   {
-      uint32_t fps = rc->frame_rate_num / MAX2(rc->frame_rate_den, 1);
-      const bool cbr =
-         vid->rc_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR;
-      /* CBR: hit the average; VBR: cap a frame at the maximum rate. */
-      uint32_t bitrate = cbr ? (rc->average_bitrate ? rc->average_bitrate
-                                                    : rc->max_bitrate)
-                             : (rc->max_bitrate ? rc->max_bitrate
-                                                : rc->average_bitrate);
-      dmem->TargetFrameSize = (fps && bitrate) ? (bitrate / fps / 8) : 0;
-   }
+   dmem->TargetFrameSize = 0;
    dmem->TargetFulness = 0;
 #endif
 

@@ -473,11 +473,7 @@ video_profile_supported(struct anv_physical_device *pdevice,
 static bool
 anv_video_encode_brc_supported(const struct anv_physical_device *pdevice)
 {
-   /* The HuC BRC path is not wired up for the Xe2 VDEnc command set yet, so
-    * only advertise rate control where the encoder is actually programmed.
-    */
-   return pdevice->info.ver >= 12 && pdevice->has_huc &&
-          pdevice->info.platform != INTEL_PLATFORM_BMG;
+   return pdevice->info.ver >= 12 && pdevice->has_huc;
 }
 
 VkResult
@@ -612,10 +608,8 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       enc_caps->rateControlModes = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR |
                                    VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
 
-      /* Only advertise HuC rate control on the validated HEVC platforms.
-       * The AVC and BMG BRC paths are not ready for application use.
-       */
-      if (pVideoProfile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR &&
+      if ((pVideoProfile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR ||
+           pVideoProfile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) &&
           anv_video_encode_brc_supported(pdevice)) {
          enc_caps->rateControlModes |= VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR |
                                        VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR;
@@ -1069,11 +1063,13 @@ get_h265_video_mem_size(struct anv_video_session *vid, uint32_t mem_idx)
    case ANV_VID_MEM_H265_VDENC_TILE_ROW_STORE:
       return align64((uint64_t)DIV_ROUND_UP(vid->vk.max_coded.width, 32) * 64 * 2, 4096);
    case ANV_VID_MEM_H265_VDENC_CU_COUNT_STREAMOUT:
+   case ANV_VID_MEM_H265_VDENC_CUMULATIVE_CU_COUNT:
    case ANV_VID_MEM_H265_MB_CODE: {
       uint64_t num_lcu =
          (uint64_t)DIV_ROUND_UP(vid->vk.max_coded.width, ANV_MAX_H265_CTB_SIZE) *
          (DIV_ROUND_UP(vid->vk.max_coded.height, ANV_MAX_H265_CTB_SIZE) + 1);
-      if (mem_idx == ANV_VID_MEM_H265_VDENC_CU_COUNT_STREAMOUT)
+      if (mem_idx == ANV_VID_MEM_H265_VDENC_CU_COUNT_STREAMOUT ||
+          mem_idx == ANV_VID_MEM_H265_VDENC_CUMULATIVE_CU_COUNT)
          return align64(num_lcu * 4, 4096);
       return align64(2 * 4 * (num_lcu * 5 + num_lcu * 64 * 8), 4096);
    }
@@ -1098,6 +1094,11 @@ get_brc_video_mem_size(struct anv_video_session *vid, uint32_t mem_idx)
    case ANV_VID_MEM_BRC_VDENC_STATS:
       return align64(1216, 4096);
    case ANV_VID_MEM_BRC_EXEC_SLB:
+   case ANV_VID_MEM_BRC_EXEC_SLB_1:
+   case ANV_VID_MEM_BRC_EXEC_SLB_2:
+   case ANV_VID_MEM_BRC_EXEC_SLB_3:
+   case ANV_VID_MEM_BRC_EXEC_SLB_4:
+   case ANV_VID_MEM_BRC_EXEC_SLB_5:
       /* - gen12:  MFX_AVC_IMG_STATE(84) + VDENC_IMG_STATE(140) + BBE(4) = 228
        * - gen125: MFX_AVC_IMG_STATE(84) + VDENC_CMD3(92) +
        *           VDENC_AVC_IMG_STATE(80) + BBE(4) = 260
@@ -1114,7 +1115,16 @@ get_brc_video_mem_size(struct anv_video_session *vid, uint32_t mem_idx)
    case ANV_VID_MEM_BRC_DEBUG:
    case ANV_VID_MEM_BRC_PAK_MMIO_SEM:
    case ANV_VID_MEM_BRC_HUC_ERR_SEM:
+   case ANV_VID_MEM_BRC_HUC_STATS_OUT:
+   case ANV_VID_MEM_BRC_DATA:
+   case ANV_VID_MEM_BRC_TILE_RECORD:
       return 4096;
+   case ANV_VID_MEM_BRC_ROI_STREAMIN:
+   case ANV_VID_MEM_BRC_ROI_DELTA_QP:
+      return 65536;
+   case ANV_VID_MEM_BRC_ROI_OUT:
+      /* HuC ROI stream output uses one cache line per entry. */
+      return 65536 * 64;
    default:
       UNREACHABLE("unknown brc memory");
    }
